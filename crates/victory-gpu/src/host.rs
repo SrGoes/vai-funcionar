@@ -2657,7 +2657,7 @@ struct Flight {
 
 /// One thing in the line of what waits for the card, in order.
 enum Late {
-    Run(Flight),
+    Run(Box<Flight>),
     /// A bottom-of-pipe write of the flight before it: address, what, bytes.
     Write(usize, crate::queue::Written, usize),
     /// A fence (its address) signalled behind the flights before it.
@@ -4854,7 +4854,7 @@ impl Host {
             let flights: Vec<&Flight> = items
                 .iter()
                 .filter_map(|l| match l {
-                    Late::Run(flight) => Some(flight),
+                    Late::Run(flight) => Some(&**flight),
                     _ => None,
                 })
                 .collect();
@@ -5197,7 +5197,7 @@ impl Host {
             );
             *flying += order.len();
             *target = *submitted;
-            items.push(Late::Run(Flight {
+            items.push(Late::Run(Box::new(Flight {
                 number: sent.number,
                 fence: *target,
                 lists,
@@ -5206,7 +5206,7 @@ impl Host {
                 back: sent.back,
                 own: sent.own,
                 texture_back_ranges: sent.texture_back_ranges,
-            }));
+            })));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
             *flying >= late_most()
         };
@@ -5252,7 +5252,7 @@ impl Host {
             );
             *flying += 1;
             *target = *submitted;
-            items.push(Late::Run(Flight {
+            items.push(Late::Run(Box::new(Flight {
                 number,
                 fence: *target,
                 lists: Vec::new(),
@@ -5261,7 +5261,7 @@ impl Host {
                 back: sent.back,
                 own: sent.own,
                 texture_back_ranges: sent.texture_back_ranges,
-            }));
+            })));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
         }
         LATE_STATS[0].fetch_add(1, Ordering::Relaxed);
