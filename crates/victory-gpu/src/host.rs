@@ -1021,6 +1021,16 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn first_buffer_oom_ignores_other_errors_and_reports_only_once() {
+        use windows::Win32::Foundation::{E_FAIL, E_OUTOFMEMORY};
+        let reported = std::sync::atomic::AtomicBool::new(false);
+        assert!(!super::first_buffer_oom(E_FAIL, &reported));
+        assert!(super::first_buffer_oom(E_OUTOFMEMORY, &reported));
+        assert!(!super::first_buffer_oom(E_OUTOFMEMORY, &reported));
+    }
+
     /// A list of ours is found by its name, with the debug layer's note or not.
     #[cfg(feature = "diagnostics")]
     #[test]
@@ -8619,6 +8629,8 @@ impl Host {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
                 crate::residency::allocation_error(&e);
+                #[cfg(feature = "diagnostics")]
+                self.report_buffer_oom(e.code(), "upload", size);
                 tracing::warn!(error = %e, size, "no upload buffer");
                 None
             }
@@ -9367,7 +9379,35 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
         .fold(state, |s, &(_, _, bits)| s & !bits)
 }
 
+#[cfg(feature = "diagnostics")]
+fn first_buffer_oom(code: windows::core::HRESULT, reported: &std::sync::atomic::AtomicBool) -> bool {
+    code == windows::Win32::Foundation::E_OUTOFMEMORY && !reported.swap(true, Ordering::Relaxed)
+}
+
 impl Host {
+    #[cfg(feature = "diagnostics")]
+    fn report_buffer_oom(&self, code: windows::core::HRESULT, allocation_class: &str, requested_bytes: u64) {
+        static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !first_buffer_oom(code, &REPORTED) {
+            return;
+        }
+        // Allocation can fail while a pool lock is held. Query the adapter and read
+        // live atomic counters, not the periodic report which visits resource owners.
+        let groups = self.video_memory_groups();
+        tracing::warn!(
+            allocation_class,
+            requested_bytes,
+            dxgi_available = groups.is_some(),
+            local_budget_bytes = groups.map(|g| g[0][0]),
+            local_usage_bytes = groups.map(|g| g[0][1]),
+            non_local_budget_bytes = groups.map(|g| g[1][0]),
+            non_local_usage_bytes = groups.map(|g| g[1][1]),
+            live_texture_staging_bytes = crate::texture::live_staging_bytes(),
+            live_shadow_span_bytes = crate::shadow::live_span_bytes(),
+            "first upload/shared buffer E_OUTOFMEMORY"
+        );
+    }
+
     /// The card's memory as the system accounts it to this process, in
     /// bytes: the budget and the use of the card's own memory, then of the
     /// PC's memory shared with the card (where the system moves what does
@@ -9506,6 +9546,8 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
+                #[cfg(feature = "diagnostics")]
+                self.report_buffer_oom(e.code(), "shared", size);
                 tracing::warn!(error = %e, size, "no shared buffer");
                 None
             }
