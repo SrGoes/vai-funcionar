@@ -5,6 +5,7 @@
 //! (unless `VICTORY_LATE_WAIT=1`, see [`late`]);
 //! overlap them with per-submission fences once more than clears run.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -3311,6 +3312,48 @@ struct Flight {
     texture_back_ranges: Vec<(usize, usize)>,
 }
 
+impl Flight {
+    /// Drops what a landed flight holds besides its host lists (shadows and
+    /// ranges), outside the line's lock.
+    fn release(&mut self) {
+        self.card = None;
+        self.own = None;
+        self.back = Vec::new();
+        self.texture_back_ranges = Vec::new();
+    }
+
+    /// Takes the host lists and their order for [`Line::landed`], leaving the
+    /// box (after [`Flight::release`]) empty, to go to [`Line::spare`].
+    fn take_lists(&mut self) -> (Vec<crate::list::Detached>, Vec<usize>) {
+        (
+            std::mem::take(&mut self.lists),
+            std::mem::take(&mut self.order),
+        )
+    }
+}
+
+/// A box for `flight`: one from `spare` if there is one (all of it
+/// overwritten), else a new one.
+fn take_box(spare: &mut VecDeque<Box<Flight>>, flight: Flight) -> Box<Flight> {
+    match spare.pop_back() {
+        Some(mut boxed) => {
+            *boxed = flight;
+            boxed
+        }
+        None => Box::new(flight),
+    }
+}
+
+/// `boxed`, a landed flight ([`Flight::release`], [`Flight::take_lists`]), goes to
+/// `spare`, which keeps `most` at most ([`late_most`]: what is kept after a burst).
+/// It never holds more than the most flights in the air at once either, as a box
+/// is made only when it is empty.
+fn give_box(spare: &mut VecDeque<Box<Flight>>, boxed: Box<Flight>, most: usize) {
+    if spare.len() < most {
+        spare.push_back(boxed);
+    }
+}
+
 /// One thing in the line of what waits for the card, in order.
 enum Late {
     Run(Box<Flight>),
@@ -3322,6 +3365,9 @@ enum Late {
 
 struct Line {
     line: Vec<Late>,
+    /// Boxes of flights landed, for the flights to come. (A deque, though it
+    /// is used as a stack: `Vec<Box<Flight>>` trips clippy's `vec_box`.)
+    spare: VecDeque<Box<Flight>>,
     /// The title memory the flights' shaders and texture readbacks may write
     /// (address, end), in order and joined.
     written: Vec<(usize, usize)>,
@@ -3352,6 +3398,7 @@ unsafe impl Send for Line {}
 
 static LINE: Mutex<Line> = Mutex::new(Line {
     line: Vec::new(),
+    spare: VecDeque::new(),
     written: Vec::new(),
     lists: 0,
     target: 0,
@@ -4410,7 +4457,81 @@ pub(crate) use stamps::{timeline_ready, timeline_restart, timeline_stamps};
 
 #[cfg(test)]
 mod late_tests {
-    use super::{continues, join_ranges, touches};
+    use super::{Flight, continues, give_box, join_ranges, take_box, touches};
+    use std::collections::VecDeque;
+
+    fn flight(number: u64) -> Flight {
+        Flight {
+            number,
+            fence: number,
+            lists: Vec::new(),
+            order: Vec::new(),
+            card: None,
+            back: Vec::new(),
+            own: None,
+            texture_back_ranges: Vec::new(),
+        }
+    }
+
+    /// Flights sent and landed over and over, at most 5 in the air: after the
+    /// first round every box is one already made, and the spare never holds
+    /// more than the peak.
+    #[test]
+    fn flights_reuse_their_boxes_up_to_the_peak_in_the_air() {
+        let mut spare = VecDeque::new();
+        let mut made = std::collections::HashSet::new();
+        for round in 0..1000u64 {
+            let air: Vec<_> = (0..5)
+                .map(|i| take_box(&mut spare, flight(round * 5 + i)))
+                .collect();
+            made.extend(air.iter().map(|b| &**b as *const Flight as usize));
+            for boxed in air {
+                give_box(&mut spare, boxed, 256);
+            }
+            assert!(spare.len() <= 5);
+        }
+        assert_eq!(made.len(), 5, "boxes made beyond the peak in the air");
+        assert_eq!(spare.len(), 5);
+    }
+
+    /// What is kept is limited: boxes beyond `most` are dropped.
+    #[test]
+    fn the_spare_keeps_no_more_than_most() {
+        let mut spare = VecDeque::new();
+        let air: Vec<_> = (0..10).map(|i| take_box(&mut spare, flight(i))).collect();
+        for boxed in air {
+            give_box(&mut spare, boxed, 3);
+        }
+        assert_eq!(spare.len(), 3);
+    }
+
+    /// A box taken from the spare holds the new flight whole, whatever the
+    /// one before left in it; and one landed is emptied of what it held.
+    #[test]
+    fn a_reused_box_carries_nothing_of_the_flight_before() {
+        let mut spare = VecDeque::new();
+        let mut old = take_box(&mut spare, flight(7));
+        old.order = vec![1, 2];
+        old.texture_back_ranges = vec![(1, 2)];
+        let at = &*old as *const Flight;
+        spare.push_back(old); // as it is: not even landed
+        let new = take_box(&mut spare, flight(8));
+        assert!(std::ptr::eq(&*new, at), "the box was not reused");
+        assert_eq!((new.number, new.fence), (8, 8));
+        assert!(new.order.is_empty() && new.lists.is_empty() && new.texture_back_ranges.is_empty());
+        assert!(new.card.is_none() && new.own.is_none() && new.back.is_empty());
+
+        let mut landed = new;
+        landed.order = vec![3];
+        landed.texture_back_ranges = vec![(4, 5)];
+        landed.release();
+        let (lists, order) = landed.take_lists();
+        assert_eq!((lists.len(), order), (0, vec![3]));
+        assert_eq!(
+            landed.order.capacity() + landed.texture_back_ranges.capacity(),
+            0
+        );
+    }
 
     /// Copies join only when both ends continue and the whole does not
     /// overlap itself.
@@ -5647,16 +5768,17 @@ impl Host {
                     for &i in &flight.order {
                         read_backs(flight.lists[i].host());
                     }
-                    if let Some(card) = flight.card {
+                    if let Some(card) = flight.card.take() {
                         self.card_done(card);
                     }
-                    if let Some(own) = flight.own {
+                    if let Some(own) = flight.own.take() {
                         own.landed();
                     }
                     for detached in &mut flight.lists {
                         detached.release_tables();
                     }
-                    landed.push((flight.lists, flight.order));
+                    flight.release();
+                    landed.push(flight);
                     crate::land::spent(crate::land::stat::READ_BACKS, telling)
                 }
                 Late::Write(at, what, bytes) => {
@@ -5681,6 +5803,7 @@ impl Host {
             let mut line = line();
             let Line {
                 line: items,
+                spare,
                 written,
                 lists,
                 settling,
@@ -5690,7 +5813,11 @@ impl Host {
                 landing,
                 ..
             } = &mut *line;
-            kept.extend(landed);
+            let most = late_most();
+            for mut flight in landed {
+                kept.push(flight.take_lists());
+                give_box(spare, flight, most);
+            }
             in_hand.clear();
             landing.clear();
             // What is still in the air, from the flights that are.
@@ -5916,7 +6043,7 @@ impl Host {
         let sizes = crate::memory::asked_sizes(order.iter().map(|&i| lists[i].host()));
         let most = {
             let mut line = line();
-            let Line { line: items, written, lists: flying, target, .. } = &mut *line;
+            let Line { line: items, spare, written, lists: flying, target, .. } = &mut *line;
             join_ranges(
                 written,
                 sent.back
@@ -5926,16 +6053,19 @@ impl Host {
             );
             *flying += order.len();
             *target = *submitted;
-            items.push(Late::Run(Box::new(Flight {
-                number: sent.number,
-                fence: *target,
-                lists,
-                order,
-                card: sent.card,
-                back: sent.back,
-                own: sent.own,
-                texture_back_ranges: sent.texture_back_ranges,
-            })));
+            items.push(Late::Run(take_box(
+                spare,
+                Flight {
+                    number: sent.number,
+                    fence: *target,
+                    lists,
+                    order,
+                    card: sent.card,
+                    back: sent.back,
+                    own: sent.own,
+                    texture_back_ranges: sent.texture_back_ranges,
+                },
+            )));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
             *flying >= late_most()
         };
@@ -5971,7 +6101,7 @@ impl Host {
         let number = sent.number;
         {
             let mut line = line();
-            let Line { line: items, written, lists: flying, target, .. } = &mut *line;
+            let Line { line: items, spare, written, lists: flying, target, .. } = &mut *line;
             join_ranges(
                 written,
                 sent.back
@@ -5981,16 +6111,19 @@ impl Host {
             );
             *flying += 1;
             *target = *submitted;
-            items.push(Late::Run(Box::new(Flight {
-                number,
-                fence: *target,
-                lists: Vec::new(),
-                order: Vec::new(),
-                card: sent.card,
-                back: sent.back,
-                own: sent.own,
-                texture_back_ranges: sent.texture_back_ranges,
-            })));
+            items.push(Late::Run(take_box(
+                spare,
+                Flight {
+                    number,
+                    fence: *target,
+                    lists: Vec::new(),
+                    order: Vec::new(),
+                    card: sent.card,
+                    back: sent.back,
+                    own: sent.own,
+                    texture_back_ranges: sent.texture_back_ranges,
+                },
+            )));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
         }
         LATE_STATS[0].fetch_add(1, Ordering::Relaxed);
@@ -6129,13 +6262,14 @@ impl Host {
                         for &i in &flight.order {
                             read_backs(flight.lists[i].host());
                         }
-                        if let Some(card) = flight.card {
+                        if let Some(card) = flight.card.take() {
                             self.card_done(card);
                         }
                         for detached in &mut flight.lists {
                             detached.release_tables();
                         }
-                        landed.push((flight.lists, flight.order));
+                        flight.release();
+                        landed.push(flight);
                     }
                     Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
                     Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
@@ -6145,7 +6279,12 @@ impl Host {
                 FINISHED.store(last, Ordering::Release);
                 bury(last);
             }
-            line().landed.extend(landed);
+            let mut line = line();
+            let most = late_most();
+            for mut flight in landed {
+                line.landed.push(flight.take_lists());
+                give_box(&mut line.spare, flight, most);
+            }
         }
         if counted {
             self.log_messages();
