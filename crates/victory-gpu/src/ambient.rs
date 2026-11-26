@@ -440,9 +440,12 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     if role == Role::Air && (constant > 0.0 || air() == 0.0) {
         return false;
     }
-    static SAID: Mutex<u32> = Mutex::new(0);
+    // Counted per role: with one count for all, three of the first four
+    // were Radiance and the Resolve (the light indoors) never showed.
+    static SAID: Mutex<[u32; 3]> = Mutex::new([0; 3]);
     {
         let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+        let said = &mut said[role as usize];
         if *said < 4 {
             *said += 1;
             tracing::info!(?role, size = ?views.size, level, constant, "a stand-in for the indirect light");

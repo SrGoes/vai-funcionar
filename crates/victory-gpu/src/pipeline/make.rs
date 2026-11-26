@@ -154,6 +154,12 @@ impl Pending {
 /// not translate, else "refused" or "being made"; `None` if it has one.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn missing(p: &Pending) -> Option<String> {
+    // Left out on purpose: never queued, so never made. Before this they were
+    // counted as "being made" (about 550 a frame of the world on an RTX 5060,
+    // with nothing queued), which read as a pipeline backlog.
+    if let Some(why) = p.left_out {
+        return Some(format!("left out: {why}"));
+    }
     match p.made.get() {
         Some(Some(_)) => None,
         None => Some("being made".into()),
@@ -584,6 +590,22 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    /// A pipeline left out on purpose is reported as such, not as one still
+    /// being made: it is never queued.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn a_left_out_pipeline_is_not_reported_as_being_made() {
+        let mut p = Pending::new(Vec::new(), None);
+        p.left_out = Some("shades ray-tracing hits without BVH, left out");
+        let p = Arc::new(p);
+        assert!(ready(&p).is_none());
+        assert_eq!(p.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
+        assert_eq!(missing(&p).as_deref(), Some("left out: shades ray-tracing hits without BVH, left out"));
+        let queued = Arc::new(Pending::new(Vec::new(), None));
+        queued.queue_state.store(MAKING, Ordering::Relaxed);
+        assert_eq!(missing(&queued).as_deref(), Some("being made"));
     }
 
     #[test]

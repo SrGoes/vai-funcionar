@@ -961,6 +961,10 @@ extern "system" fn present(
             before_sync();
             crate::capture::dump_targets(frame);
         }
+        if crate::capture::bakes_waiting() {
+            before_sync();
+            crate::capture::dump_bakes(frame);
+        }
     }
     #[cfg(windows)]
     if behind::on() && !this.is_null() {

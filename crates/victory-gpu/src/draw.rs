@@ -2292,6 +2292,12 @@ impl State {
             return;
         }
         let is_bake = bake_ms > 0 && self.is_bake_draw(p);
+        #[cfg(feature = "diagnostics")]
+        if is_bake {
+            for &target in &self.targets {
+                crate::capture::note_bake_target(target as This);
+            }
+        }
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         // The milliseconds this frame's bake draws have taken so far: a
         // frame has several, and together they get `bake_ms`.

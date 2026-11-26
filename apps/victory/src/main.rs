@@ -139,7 +139,9 @@ enum Command {
         /// Actually start the title. Without it, stop after binding.
         #[arg(long)]
         execute: bool,
-        /// The console model the title sees (device type, memory).
+        /// The console model the title sees (device type, memory). `auto`:
+        /// Series S unless the PC has the RAM and video memory Series X
+        /// needs (48 GiB, 12 GiB); the choice and the figures are printed.
         #[arg(long, value_enum, default_value_t = Console::SeriesX)]
         console: Console,
         /// Arguments for the title, after `--` (it reads the whole command
@@ -165,6 +167,7 @@ enum Unimplemented {
 enum Console {
     SeriesX,
     SeriesS,
+    Auto,
 }
 
 fn main() -> Result<()> {

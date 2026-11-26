@@ -104,6 +104,19 @@ pub fn run(
     victory_hle::console::set(match console {
         Console::SeriesX => victory_hle::console::Console::SeriesX,
         Console::SeriesS => victory_hle::console::Console::SeriesS,
+        Console::Auto => {
+            let host = victory_hle::console::HostMemory::of_host();
+            let chosen = host.console();
+            println!(
+                "console auto   {} (RAM {} MiB, video memory {} MiB; Series X from {} MiB and {} MiB)",
+                chosen.name(),
+                host.ram >> 20,
+                host.vram >> 20,
+                victory_hle::console::HostMemory::SERIES_X_RAM >> 20,
+                victory_hle::console::HostMemory::SERIES_X_VRAM >> 20,
+            );
+            chosen
+        }
     });
     println!("console        {}", victory_hle::console::current().name());
     let dlls = victory_loader::load_title_dlls(image.info(), title_dir, &images, &wanted)?;

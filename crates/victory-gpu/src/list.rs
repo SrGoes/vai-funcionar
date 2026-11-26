@@ -1153,15 +1153,20 @@ extern "system" fn copy_texture_region(
             let text = || {
                 // SAFETY: a live texture; the box is the title's or null.
                 let (d, b) = unsafe { (to.GetDesc(), host_box.map(|b| *b)) };
+                // (A subresource index sits where a footprint's offset does.)
+                let sub = |l: &CopyLocation| if l.kind == FOOTPRINT { "footprint".to_owned() } else { format!("sub {}", l.footprint.offset as u32) };
                 format!(
-                    "copy to {:?} {}x{} f{} sub/kind {} at {x},{y},{z} from {:?} kind {} footprint {:?} box {b:?}",
+                    "copy to {:?} {}x{} f{} levels {} sub/kind {} ({}) at {x},{y},{z} from {:?} kind {} ({}) footprint {:?} box {b:?}",
                     dst.resource,
                     d.Width,
                     d.Height,
                     d.Format.0,
+                    d.MipLevels,
                     dst.kind,
+                    sub(&dst),
                     src.resource,
                     src.kind,
+                    sub(&src),
                     (src.kind == FOOTPRINT).then_some(src.footprint)
                 )
             };
