@@ -23,6 +23,8 @@ Esta pasta mantém alinhadas as sessões de agente (Claude ou outro) que trabalh
 | Lacunas | `gaps.md`, com o número da issue quando existir |
 | Achados com número | `findings/AAAA-MM-DD-assunto.md` |
 | Ports de outros forks | `docs/ports/AAAA-MM-DD-fork.md` |
+| Hardware de cada máquina | `machines.md` |
+| Ferramentas de arquivos do jogo | `vi-tools.md` |
 
 ## Regras para manter isto vivo
 - Ao terminar uma sessão de trabalho: atualize `handoff.md` e `gaps.md` no mesmo PR do trabalho.
