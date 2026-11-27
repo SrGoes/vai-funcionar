@@ -466,6 +466,8 @@ enum MaskData {
 
 /// What a value holding a lane mask read as a number stops with.
 pub(super) const LANE_MASK: Why = "a lane mask read as data";
+/// A wave-wide branch ([`Lower::wave_wide`]) in a block not every lane of the console wave runs.
+pub(super) const WAVE_WIDE_ELSEWHERE: Why = "a wave-wide branch where not every lane runs";
 pub(super) const DIVERGENT_MASK_EXCHANGE: Why = "a lane mask exchanged where not every lane runs";
 pub(super) const GROUP_BARRIER_DIVERGENT: Why = "a group barrier where not every lane runs";
 /// A per-wave meet asked for in a block other than the one being lowered ([`Lower::order_waves`]).
@@ -5001,7 +5003,7 @@ impl<'a> Lower<'a> {
     }
 
     fn wave_wide(&mut self, b: usize, when: Bool) -> Result<V, Why> {
-        const WHY: Why = "a wave-wide branch where not every lane runs";
+        const WHY: Why = WAVE_WIDE_ELSEWHERE;
         let any = self.x.st.wave_any.get(b).copied().flatten().ok_or("a wave-wide branch on a scalar condition")?;
         if self.exchange.is_none() && self.halves.is_none() && self.console_lanes && self.mask_data == MaskData::Console {
             // The host's waves are the console's: the wave's own answer. The lanes that are
