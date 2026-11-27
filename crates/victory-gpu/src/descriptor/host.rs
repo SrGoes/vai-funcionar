@@ -3143,47 +3143,33 @@ impl HostHeap {
                 views.made.clear();
             }
             let twins = self.twins.get(index as usize).is_some();
-            if !views.made.contains_key(&words) {
-                let view = super::view_at(words[1], words[2])?;
-                let at = 2 * views.made.len() as u32;
-                // (A constant buffer's bytes are copied for each draw.)
-                if at >= ListViews::SLOTS || matches!(view, View::Constant(..)) {
-                    return None;
-                }
-                let twin = twinned(&view);
-                let kept = make_twinned(&view, views.slot(at), Some(views.slot(at + 1)))?;
-                let stride_word = view_stride_word(&view);
-                let address = view_address(&view).unwrap_or(0);
-                let listed = Listed {
-                    kind: crate::draw::view_kind(&view),
-                    texture: is_texture_view(&view),
-                    ready: (0, 0, false),
-                    tabled: None,
-                };
-                views.made.insert(
-                    words,
-                    ListView {
-                        view,
-                        at,
-                        twin,
-                        stride_word,
-                        address,
-                        kept,
-                        listed,
-                    },
-                );
+            let quick = draw_quick();
+            if !quick && !views.made.contains_key(&words) {
+                let made = ListView::make(words, 2 * views.made.len() as u32, |i| views.slot(i))?;
+                views.made.insert(words, made);
             }
-            let made = &views.made[&words];
-            self.copy_from(index, views.slot(made.at));
+            let (start, step) = (views.start, views.step);
+            let slot = |i: u32| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start + i as usize * step };
+            let made = if quick {
+                // One lookup for a view made before, not two.
+                let at = 2 * views.made.len() as u32;
+                match views.made.entry(words) {
+                    std::collections::hash_map::Entry::Occupied(e) => &*e.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(e) => &*e.insert(ListView::make(words, at, slot)?),
+                }
+            } else {
+                &views.made[&words]
+            };
+            self.copy_from(index, slot(made.at));
             if made.twin && twins {
-                self.copy_from(self.raw + index, views.slot(made.at + 1));
+                self.copy_from(self.raw + index, slot(made.at + 1));
                 self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
             } else {
                 self.clear_twin(index);
             }
             self.write_stride(index, made.stride_word);
             self.write_address(index, made.address);
-            self.keep(index, made.kept.clone());
+            self.keep_ref(index, made.kept.as_ref());
             Some(made.listed)
         })
     }
@@ -3243,6 +3229,28 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+        let raw = resource.as_ref().map(windows::core::Interface::as_raw);
+        self.keep_with(index, raw, || resource);
+    }
+
+    /// As [`HostHeap::keep`]; with [`draw_quick`], `resource` is cloned
+    /// only if the slot holds another (a reference to an object every
+    /// recording thread shares, taken and let go again for nothing).
+    fn keep_ref(&self, index: u32, resource: Option<&ID3D12Resource>) {
+        if !draw_quick() {
+            return self.keep(index, resource.cloned());
+        }
+        self.keep_with(index, resource.map(windows::core::Interface::as_raw), || resource.cloned());
+    }
+
+    /// Slot `index` now views the resource `raw` names, which `resource`
+    /// gives if the slot holds another.
+    fn keep_with(
+        &self,
+        index: u32,
+        raw: Option<*mut std::ffi::c_void>,
+        resource: impl FnOnce() -> Option<ID3D12Resource>,
+    ) {
         let Some(slot) = self.kept.get(index as usize) else {
             return;
         };
@@ -3250,10 +3258,10 @@ impl HostHeap {
             use windows::core::Interface;
             let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
             // The same again: nothing to retire.
-            if slot.as_ref().map(Interface::as_raw) == resource.as_ref().map(Interface::as_raw) {
+            if slot.as_ref().map(Interface::as_raw) == raw {
                 return;
             }
-            std::mem::replace(&mut *slot, resource)
+            std::mem::replace(&mut *slot, resource())
         };
         // A running submission may still read the old resource through
         // this slot.
@@ -3297,7 +3305,7 @@ impl HostHeap {
         self.clear_twin(index);
         self.write_stride(index, 1);
         self.write_address(index, 0);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_ref(index, Some(buffer));
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view that reads
@@ -3344,7 +3352,7 @@ impl HostHeap {
         self.clear_twin(index);
         self.write_stride(index, 1);
         self.write_address(index, 0);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_ref(index, Some(buffer));
     }
 
     /// Makes slot `index` (a dynamic one) a raw unordered access view of
@@ -3436,7 +3444,7 @@ impl HostHeap {
         self.write_address(index, 0);
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
-        self.keep(index, holds.then(|| buffer.clone()));
+        self.keep_ref(index, holds.then_some(buffer));
     }
 
     /// Renderer port 5 (`crate::port_cbv`): makes slot `index` (a dynamic
@@ -3484,7 +3492,7 @@ impl HostHeap {
             host.device.CreateShaderResourceView(buffer, Some(&raw), twin);
         }
         self.twin_made(index, true);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_ref(index, Some(buffer));
         true
     }
 
@@ -6523,6 +6531,83 @@ mod tests {
         assert_eq!(heap.dynamic(2), None);
     }
 
+    /// `VICTORY_DRAW_QUICK` makes the same slots as without it: what each
+    /// holds, its stride and address, and what a list knows of its views;
+    /// and a slot shown again what it holds takes no reference to it.
+    #[test]
+    fn draw_quick_makes_the_same_slots() {
+        use windows::core::Interface;
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let (a, _) = host.upload_buffer(1 << 16).expect("an upload buffer");
+        let (b, _) = host.upload_buffer(1 << 16).expect("an upload buffer");
+        // The references to `r`, the one taken here among them.
+        let refs = |r: &ID3D12Resource| {
+            let u: windows::core::IUnknown = r.cast().unwrap();
+            // SAFETY: a live object, its reference given back at once.
+            unsafe {
+                (Interface::vtable(&u).AddRef)(u.as_raw());
+                (Interface::vtable(&u).Release)(u.as_raw())
+            }
+        };
+        let memory = vec![0u64; 1 << 11];
+        let addr = (memory.as_ptr() as u64).next_multiple_of(4096);
+        let placed = |dxgi_fmt: u32| {
+            let resource: [u32; 14] = [1, 0, 0, 0, 4096, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
+            let mut desc = [0u32; 16];
+            desc[..10].copy_from_slice(&[dxgi_fmt, 1, 0, 0, 64, 0, 0, 0, 0, 0]);
+            (desc[10], desc[11]) = (addr as u32, (addr >> 32) as u32);
+            let mut slot = [0u32; 8];
+            crate::descriptor::record(slot.as_mut_ptr() as u64, View::Placed(true, resource, desc));
+            [slot[0], slot[1], slot[2]]
+        };
+        let (u16x4, f16x4) = (placed(12), placed(10));
+        let heap = HostHeap::new(false, 4).expect("a host heap");
+        let run = |quick: bool| {
+            DRAW_QUICK_IN_TEST.set(Some(quick));
+            assert_eq!(draw_quick(), quick);
+            let (Some((_, _, strides)), Some((_, _, addresses))) = (&heap.strides, &heap.addresses) else {
+                panic!("a view heap has strides and addresses tables");
+            };
+            let s = heap.dynamic(4).unwrap();
+            heap.raw_at(s, &a, 0, 256);
+            let held = refs(&a);
+            heap.raw_at(s, &a, 0, 256);
+            assert_eq!(refs(&a), held, "the same again takes no reference");
+            heap.raw_at(s + 1, &a, 0, 256);
+            // SAFETY: a live buffer.
+            heap.constant_at(s + 2, &b, unsafe { b.GetGPUVirtualAddress() }, 256);
+            heap.constant_raw_at(s + 3, &b, unsafe { b.GetGPUVirtualAddress() }, 256);
+            heap.raw_at(s, &b, 0, 256);
+            // A list's views: made, made, found again, in two recordings.
+            let recording = 0xd1a0 + u64::from(quick);
+            let listed = [(u16x4, s + 1), (f16x4, s + 2), (u16x4, s + 2), (f16x4, s + 3)]
+                .map(|(words, at)| heap.make_listed(recording, words, at).map(|l| (l.kind, l.texture)));
+            let again = heap.make_listed(recording + 2, f16x4, s + 1).map(|l| (l.kind, l.texture));
+            let slots = (s..s + 4).map(|i| {
+                // SAFETY: inside the mappings of the strides and addresses tables.
+                let (stride, address) = unsafe {
+                    let words = *addresses as *const u32;
+                    (
+                        *(*strides as *const u32).add(i as usize),
+                        u64::from(*words.add(i as usize * 2)) | u64::from(*words.add(i as usize * 2 + 1)) << 32,
+                    )
+                };
+                (heap.kept_in(i).map(|r| r.as_raw() as usize), stride, address)
+            });
+            // SAFETY: a plain device query.
+            assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok(), "the device stays");
+            let seen = (slots.collect::<Vec<_>>(), listed, again);
+            DRAW_QUICK_IN_TEST.set(None);
+            seen
+        };
+        let (slow, quick) = (run(false), run(true));
+        assert!(slow.1.iter().all(Option::is_some), "the views are listed");
+        assert_eq!(slow.0[0].0, Some(b.as_raw() as usize));
+        assert_eq!(slow, quick);
+    }
+
     #[test]
     fn dynamic_slots_populate_and_clear_stride_table() {
         use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED};
@@ -6632,6 +6717,37 @@ struct ListView {
     listed: Listed,
 }
 
+impl ListView {
+    /// The view the record `words` names, its descriptor made in `slot(at)`
+    /// and its raw twin in `slot(at + 1)`; `None`: not a view kept so.
+    fn make(words: [u32; 3], at: u32, slot: impl Fn(u32) -> D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ListView> {
+        let view = super::view_at(words[1], words[2])?;
+        // (A constant buffer's bytes are copied for each draw.)
+        if at >= ListViews::SLOTS || matches!(view, View::Constant(..)) {
+            return None;
+        }
+        let twin = twinned(&view);
+        let kept = make_twinned(&view, slot(at), Some(slot(at + 1)))?;
+        let stride_word = view_stride_word(&view);
+        let address = view_address(&view).unwrap_or(0);
+        let listed = Listed {
+            kind: crate::draw::view_kind(&view),
+            texture: is_texture_view(&view),
+            ready: (0, 0, false),
+            tabled: None,
+        };
+        Some(ListView {
+            view,
+            at,
+            twin,
+            stride_word,
+            address,
+            kept,
+            listed,
+        })
+    }
+}
+
 /// The descriptors a thread made for one recording of a list, by the record
 /// they were made from, in a heap the card does not see.
 ///
@@ -6705,6 +6821,34 @@ pub(crate) fn note_listed(recording: u64, words: [u32; 3], listed: Listed) {
 /// for every table).
 pub(crate) fn list_views() -> bool {
     crate::toggled!("VICTORY_LIST_VIEWS")
+}
+
+/// Whether slots are made the quicker way, to the same slots
+/// (`VICTORY_DRAW_QUICK=1`; A/B-able by that name): a slot shown again
+/// what it holds takes no reference to it ([`HostHeap::keep_ref`]), and a
+/// view a list made before is found with one lookup
+/// ([`HostHeap::make_listed`]).
+pub(crate) fn draw_quick() -> bool {
+    #[cfg(test)]
+    if let Some(on) = DRAW_QUICK_IN_TEST.get() {
+        return on;
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        // The bit, not `pick`, which compares names: this runs for every
+        // slot made.
+        static BIT: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+        if let Some(bit) = *BIT.get_or_init(|| crate::ab::bit("VICTORY_DRAW_QUICK")) {
+            return crate::ab::on(bit);
+        }
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_DRAW_QUICK").is_ok_and(|v| v.trim() == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    static DRAW_QUICK_IN_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
