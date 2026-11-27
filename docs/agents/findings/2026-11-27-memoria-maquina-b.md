@@ -140,3 +140,24 @@ Os buffers do jogo, para comparação, somam 756 MB: 252 privados inteiros, 230 
 2. **Janelas na VRAM:** é para onde ainda dá para mover os ~2,5 GB de janelas que ficam na RAM. Hoje a porta (`VICTORY_WINDOWS_BAR_MB`) só aceita janelas com a placa abaixo de 80% do orçamento, e com `-SmallRam` ela fica perto de 95%. Uma troca a medir: `VICTORY_TEXTURE_MAX=512` libera VRAM para as janelas, ao preço de textura menor. É troca de imagem por memória, e a decisão vai ao Bruno.
 3. **Heaps do processo:** 3,3 GB e crescendo ~25 MB/min. Achar de quem é com "our own allocations" ao longo de uma sessão longa.
 4. **O que o jogo vê de si mesmo:** o `XMemGetWorkingSetStatistics` dá ao jogo o commit do processo inteiro (aqui ~19-21 GB, contra o limite de 7,8 GB do Series S). Registrar o que ele faz depois dessa chamada.
+
+## `VICTORY_INPLACE=1` com `-SmallRam` (27/11, 16:39-16:51, uma rodada)
+Branch `test/smallram-inplace`: o PR #57 com `VICTORY_INPLACE=1` dentro do `-SmallRam`.
+
+**O que entrou no lugar:** 72 a 83 janelas, 348 a 400 MB, leem a memória do jogo sem cópia, sem atualização e sem cópia de volta. Nenhum buffer do jogo entrou, porque isso é o `=2`. Bate com o censo: ~80 janelas, ~0,4 GB.
+
+| Rodada `-SmallRam` | Duração | Quadros com mundo: FPS / ms / preparo / cópia de volta / draws | Compartilhada (mediana) | Privada (mediana) | Páginas lidas/s (mediana, p90) | Quedas / falhas de upload |
+|---|---|---|---|---|---|---|
+| **`INPLACE=1`** | 11,3 min | 8,0 / 126 / 92 / 30 / 3.801 | **4.737 MB** | 18.284 MB | 2.012, 25.373 | 0 / 0 |
+| sem, rodada longa (`texmax`) | 33,6 min | 4,9 / 204 / 106 / 33 / 5.846 (0-8 min: 6,7 / 149) | 6.128 MB (5.604 nos primeiros 11 min) | 20.465 MB | — | 0 / 296 |
+| sem, rodada da linha do tempo | 6,8 min | 8,4 / 119 / 86 / 25 / 3.410 | 4.426 MB | 17.867 MB | 9.644, 69.219 | 0 / 0 |
+
+**Leitura:** nada piorou. A memória compartilhada ficou ~0,9 GB abaixo da rodada longa no mesmo intervalo, e a paginação ficou bem abaixo da rodada da linha do tempo. O FPS ficou entre as duas rodadas sem a chave.
+
+**Não é prova de ganho de FPS:**
+- é uma rodada só;
+- esta começou do checkpoint do barco, porque o save avançou, e a rodada longa começou na prisão. As cenas não batem.
+
+O jogador sentiu o jogo melhor.
+
+**Imagem (capturas):** a cutscene do avião tem cabelo, pele e pelos no braço. A perseguição de barco tem água, céu e HUD bons. Numa captura tardia, o fundo desfocado do menu de pausa ficou roxo; a anterior estava normal. Não dá para atribuir isso ao `INPLACE` sem A/B. É o próximo ponto a conferir com a imagem.
