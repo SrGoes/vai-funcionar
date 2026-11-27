@@ -5655,7 +5655,7 @@ mod shared_table_tests {
         let reserved = h.dynamic_capacity() - 130;
         let first = h.dynamic(reserved).unwrap();
         struct Reservation<'a>(&'a crate::descriptor::host::HostHeap, u32, u32);
-        impl Drop for Reservation<'_> { fn drop(&mut self) { self.0.release(self.1, self.2); } }
+        impl Drop for Reservation<'_> { fn drop(&mut self) { self.0.release(self.0.id(), self.1, self.2); } }
         let _reservation = Reservation(h, first, reserved);
         #[repr(C, align(256))]
         struct Constants([u32; 64]);
@@ -5703,7 +5703,7 @@ mod shared_table_tests {
         assert_eq!(&*v, &*p);
         assert_ne!(v[0].1, u32::MAX);
         assert_eq!(state.dynamic.len(), 1);
-        assert_eq!(state.dynamic[0].2, 128);
+        assert_eq!(state.dynamic[0].3, 128);
 
         const SOURCE: &str = r#"
 #define RS "DescriptorTable(CBV(b0, numDescriptors=128)), UAV(u0)"
