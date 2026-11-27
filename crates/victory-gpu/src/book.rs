@@ -76,7 +76,7 @@ pub(crate) fn on() -> bool {
     *ON.get_or_init(|| {
         std::env::var_os("VICTORY_BOOK").is_none_or(|v| v != "0")
             && !cfg!(test)
-            && (crate::host::dred_any() || checks())
+            && (crate::host::dred_any() || checks() || summaries())
     })
 }
 
@@ -489,6 +489,73 @@ fn bases(names: Names) -> Vec<(&'static str, u64)> {
     }
 }
 
+/// `VICTORY_BOOK_SUMMARY=1`: the book is kept, and every 30 s the log says
+/// who holds the most of it ([`summary`]).
+fn summaries() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BOOK_SUMMARY").is_some_and(|v| v == "1"))
+}
+
+/// A name with its numbers taken out, so that copies of one kind are one
+/// group: "title view 0x2e95+0x400" and "title view 0x31a0+0x80" are
+/// "title view #+#".
+fn kind_of_name(what: &str) -> String {
+    let mut out = String::with_capacity(what.len());
+    let mut chars = what.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_ascii_digit() {
+            // A number, hexadecimal or not, is one '#'.
+            if c == '0' && chars.peek() == Some(&'x') {
+                chars.next();
+            }
+            while chars.peek().is_some_and(|d| d.is_ascii_hexdigit()) {
+                chars.next();
+            }
+            out.push('#');
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The live entries by [`kind_of_name`]: (bytes, count, kind), the most
+/// bytes first.
+fn groups(live: impl Iterator<Item = (u64, String)>) -> Vec<(u64, u64, String)> {
+    let mut by: HashMap<String, (u64, u64)> = HashMap::new();
+    for (size, what) in live {
+        let g = by.entry(kind_of_name(&what)).or_default();
+        g.0 += size;
+        g.1 += 1;
+    }
+    let mut all: Vec<(u64, u64, String)> = by.into_iter().map(|(k, (b, n))| (b, n, k)).collect();
+    all.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.2.cmp(&b.2)));
+    all
+}
+
+/// With [`summaries`], at most every 30 s (called once a second by the
+/// sweep): the 20 kinds of what is alive in the book with the most bytes.
+/// The memory map says how much of each kind of memory the process has,
+/// not whose; this says whose (by the names our code gives).
+pub(crate) fn summary() {
+    if !summaries() || !on() {
+        return;
+    }
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = crate::host::now_ms();
+    let last = LAST.load(Ordering::Relaxed);
+    if now < last + 30_000 || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return;
+    }
+    let (all, total, count) = with(|b| {
+        let total = b.live.values().map(|e| e.size).sum::<u64>();
+        (groups(b.live.values().map(|e| (e.size, e.what.clone()))), total, b.live.len())
+    });
+    let text: Vec<String> =
+        all.iter().take(20).map(|(bytes, n, kind)| format!("{} MB in {n} {kind}", bytes >> 20)).collect();
+    tracing::info!("who holds the card's memory and ours (VICTORY_BOOK_SUMMARY): {} MB in {count} alive; {}", total >> 20, text.join("; "));
+}
+
 /// Starts the thread of `VICTORY_SLOT_CHECK=1`, once.
 pub(crate) fn check() {
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -679,6 +746,19 @@ pub(crate) fn at_loss(va: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Names that differ only by their numbers are one group, the most bytes first.
+    #[test]
+    fn copies_of_one_kind_are_one_group() {
+        assert_eq!(kind_of_name("title view 0x2e95ab00+0x400"), "title view #+#");
+        assert_eq!(kind_of_name("staging of textures (a block)"), "staging of textures (a block)");
+        assert_eq!(kind_of_name("staging of 0x1c6 1024x512x1 f71"), "staging of # #x#x# f#");
+        let g = groups(
+            [(256, "title view 0x10+0x40".to_string()), (512, "title view 0x20+0x80".into()), (4096, "a block of textures".into())]
+                .into_iter(),
+        );
+        assert_eq!(g, vec![(4096, 1, "a block of textures".to_string()), (768, 2, "title view #+#".to_string())]);
+    }
 
     /// The two descriptors of the card that were read (a texture of 64x64 and
     /// one of 2048x2048, RX 7900 XTX) and a raw buffer's.
