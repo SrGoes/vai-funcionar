@@ -27,6 +27,11 @@ Branch `fix/shared-budget-guard`. Rota nvidia, build de diagnóstico da `main` e
 - **Imagem dessa rodada:** cabelo presente (Lucia e NPCs), personagens com textura, água e céu bons. Nas rodadas anteriores, o preto do cenário vinha de uma fila de 13 a 25 mil texturas esperando subir (`VICTORY_TEXTURE_NO_WAIT=1`). Com o teto de 1024, a fila caiu para 6-8 mil no mundo. Os interiores continuam escuros e chapados por causa da luz substituta (`constant:0.8`), já que o ray tracing está fora. O ruído colorido num cartaz continuou mesmo com o defrag fora.
 - **Nada disso é padrão do kit nvidia:** é a chave `-SmallRam`. Mudar o padrão fica para o Bruno, com as imagens.
 - **Não medido:** FPS em ponto fixo com 3 rodadas. Os números acima são de uma rodada por configuração, em cenas que andam sozinhas. As janelas finas (`VICTORY_WINDOW_KB=256` com `VICTORY_WINDOW_TAILS=1`) não reduziram as janelas (4,95 GB em 8.653 janelas) e o FPS pareceu menor, por isso ficaram de fora. O kit da madrugada (PR #56) não mostrou ganho aqui numa rodada (6,13 FPS na base, 5,76 com o kit); `VICTORY_REAPER=0` deu 4,79.
+- **Para onde vai o quadro com `-SmallRam`** (linha do tempo aos 300 s e paginação por WMI; ver `findings/2026-11-27-trava-exact-e-paginacao-maquina-b.md`):
+  - 94% da espera dentro das chamadas de lista longas é a trava de `shadow::exact`, que varre ~4.000 cópias a cada miss (300-400 misses por quadro) e cria buffers segurando a trava;
+  - a RAM vai para o disco o tempo todo (mediana de 9.644 páginas por segundo; RAM livre de 911 MB).
+
+  **Próximo passo:** abrir uma vez o build `test/night-smallram` (PR #56 com o PR #57, já compilado) com `-SmallRam` e a linha do tempo nos mesmos horários, para medir o `EXACT_LAZY` aqui. Depois, tirar a criação de buffer de dentro da trava.
 
 ## Em uma frase
 O port abre e chega ao mundo em placa NVIDIA no Windows 10, a 8-12 FPS e sem o roxo, mas está abaixo dos dois pisos de "jogável": falta FPS, a água tem retângulos, a vegetação pisca ao andar e a iluminação do jogo não roda.
