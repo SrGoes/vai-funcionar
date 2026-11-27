@@ -10,6 +10,13 @@
 
 use std::mem::ManuallyDrop;
 
+/// The Agility SDK runtime `victory.exe` runs on, as for the unit tests: the
+/// in-box D3D12 of Windows 10 refuses the mesh pipeline, and the recorder must
+/// be tried against the runtime the title meets.
+#[cfg(agility_runtime)]
+#[path = "../src/agility.rs"]
+mod agility;
+
 use victory_gpu::replay::play::{self, Buffers, Options, Player};
 use victory_gpu::replay::record::{self, At, Settings};
 use windows::Win32::Foundation::{HANDLE, HWND, RECT};
