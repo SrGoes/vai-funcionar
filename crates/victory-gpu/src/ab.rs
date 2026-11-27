@@ -65,6 +65,39 @@ fn summary(frames: &mut [f32]) -> (f32, f32, f32) {
     (mean, frames[frames.len() / 2], frames[frames.len() * 9 / 10])
 }
 
+/// `VICTORY_FRAME_TIMES=<file>`: one line per present, `seconds,ms,draws`: the time since
+/// the run began, since the present before, and the draws in between. The title's own
+/// line gives only two-second averages; 1% lows and p99 need every frame.
+pub(crate) fn frame_time() {
+    use std::io::Write;
+    struct Out {
+        file: std::fs::File,
+        started: std::time::Instant,
+        last: std::time::Instant,
+        drawn: u64,
+    }
+    static OUT: OnceLock<Option<Mutex<Out>>> = OnceLock::new();
+    let now = std::time::Instant::now();
+    let Some(out) = OUT.get_or_init(|| {
+        let mut file = std::fs::File::create(std::env::var_os("VICTORY_FRAME_TIMES")?).ok()?;
+        let _ = writeln!(file, "seconds,ms,draws");
+        Some(Mutex::new(Out { file, started: now, last: now, drawn: crate::draw::drawn() }))
+    }) else {
+        return;
+    };
+    let mut o = out.lock().unwrap_or_else(|e| e.into_inner());
+    let drawn = crate::draw::drawn();
+    let line = format!(
+        "{:.3},{:.3},{}\n",
+        (now - o.started).as_secs_f64(),
+        (now - o.last).as_secs_f64() * 1000.0,
+        drawn.saturating_sub(o.drawn)
+    );
+    // Unbuffered: a run the measurer closes keeps every line written.
+    let _ = o.file.write_all(line.as_bytes());
+    (o.last, o.drawn) = (now, drawn);
+}
+
 /// The title's present ends on this thread. `change`: called when another
 /// phase begins, before any switch changes, with what `switch` is and what it
 /// will be.
