@@ -45,6 +45,13 @@ cd cool_fox
 cargo build --release --locked -p victory
 ```
 
+On Windows 10, run `cargo xtask agility` once before building. Windows 10's
+in-box D3D12 runtime stops at shader model 6.5 and refuses every translated
+pipeline; the command puts Microsoft's D3D12 Agility SDK runtime (a pinned NuGet
+package, its SHA-512 checked) in `target\<profile>\D3D12\`, where `victory.exe`
+and the shader tests load it. `victory config` says which runtime is named.
+Windows 11 needs nothing.
+
 ### Launch
 
 ```powershell
