@@ -5658,12 +5658,17 @@ fn exact_lazy() -> bool {
 /// Misses between two looks for idle copies when lazy.
 const LAZY_MISSES: u64 = 64;
 
+/// Past this many copies the lazy sweep runs at every miss again. The title keeps
+/// ~8,700 copies alive in the world (run fx-hoje, 27/11), so a ceiling of 4 * MANY
+/// (1,024) meant the lazy sweep never applied.
+const LAZY_CEILING: usize = 64 * MANY;
+
 /// Whether [`exact`] looks for idle copies now: never under `many` kept;
 /// then at each miss, or when lazy once [`LAZY_MISSES`] have passed since
 /// the last look or the map is at four times `many` (so it cannot grow
 /// without bound while the copies are held).
 fn sweep_due(kept: usize, misses: u64, lazy: bool) -> bool {
-    kept >= MANY && (!lazy || misses >= LAZY_MISSES || kept >= 4 * MANY)
+    kept >= MANY && (!lazy || misses >= LAZY_MISSES || kept >= LAZY_CEILING)
 }
 
 /// Copies kept before the idle ones are looked for.
@@ -5882,8 +5887,10 @@ mod exact_tests {
         assert!(sweep_due(256, 64, true));
         assert!(sweep_due(500, 1_000, true));
         // Lazy over the ceiling: every miss, as eager (the map must not grow).
-        assert!(sweep_due(1_024, 0, true));
-        assert!(!sweep_due(1_023, 0, true));
+        assert!(sweep_due(super::LAZY_CEILING, 0, true));
+        assert!(!sweep_due(super::LAZY_CEILING - 1, 0, true));
+        // The world's ~8,700 copies stay lazy.
+        assert!(!sweep_due(8_700, 0, true));
     }
 
     /// A thing let go is taken by its width, once its submission finished,
