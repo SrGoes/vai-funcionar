@@ -77,6 +77,13 @@ if ($Route -eq 'amd') {
         VICTORY_PORT_CONSTANTS = '0'; VICTORY_PORT_CBV = '0'
         VICTORY_LIBRARY_STORE_LATER = '1'; VICTORY_PIPELINE_WAIT_MS = '0'; VICTORY_UPLOAD_AHEAD = '1'
         VICTORY_LEVELS_ON_DEMAND = '1'; VICTORY_CARD_BUFFERS_MIN_KB = '64'
+        # 27/11 night, RTX 4080 / 9800X3D, fixed scene by bench.py: 9.3 -> 12-13 fps
+        # (p50 96 -> 58 ms; 1% low did not improve). EXACT_LAZY is most of it: the
+        # recording threads queued on the EXACT lock while it swept ~8,700 copies at
+        # every miss. The others each gave 1.5-4.5 ms in A/B runs (VICTORY_AB).
+        VICTORY_EXACT_LAZY = '1'; VICTORY_COPY_BY_RANGE = '1'; VICTORY_FLUSH_GROUPED = '1'
+        VICTORY_TEXTURE_ONCE_A_FRAME = '1'; VICTORY_CARD_STEPS_JOIN = '1'
+        VICTORY_PORT_GUARD = '1'; VICTORY_PORT_GUARD_PLAN = '1'; VICTORY_ASK_NORESET = '1'
     }
     if ($LowMemory) {
         # Play-VIctory-4GB.cmd: the estimate (not the constant), the guard at its
