@@ -1867,6 +1867,8 @@ impl State {
                 crate::picked::runs_in(list);
             }
             let made = self.tables_with_extents(list, &t.tables, compute, &extents);
+            #[cfg(feature = "diagnostics")]
+            self.trace_buffer_placement(&t.tables, compute, &stage.shader.hash);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -4464,6 +4466,43 @@ impl State {
             made.push((slot, first * 32));
         }
         made
+    }
+
+    /// Opt-in placement evidence for buffers a selected shader already bound.
+    /// Reports each view once; does not change allocation or synchronization.
+    #[cfg(feature = "diagnostics")]
+    fn trace_buffer_placement(&self, plan: &TablePlan, compute: bool, shader: &str) {
+        static PICKED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        let picked = PICKED.get_or_init(|| std::env::var("VICTORY_TRACE_BUFFER_PLACEMENT")
+            .unwrap_or_default().split(',').map(|s| s.trim().to_ascii_lowercase()).collect());
+        if !picked.iter().any(|s| s == shader) {
+            return;
+        }
+        static SEEN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<(String, u64, u64)>>> =
+            std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+        for group in &plan.groups {
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(group.slot)) else { continue };
+            for used in &group.entries {
+                let handle = table + u64::from(used.table_offset_dwords) * 4;
+                let Some(view) = crate::descriptor::view(handle) else { continue };
+                let Some((shadow, address, bytes)) = crate::descriptor::host::buffer_copy(&view) else { continue };
+                if !SEEN.lock().unwrap_or_else(|e| e.into_inner()).insert((shader.to_owned(), address, bytes)) {
+                    continue;
+                }
+                let mut heap = D3D12_HEAP_PROPERTIES::default();
+                let mut flags = D3D12_HEAP_FLAGS::default();
+                // SAFETY: a live resource whose placement is queried only.
+                let queried = unsafe { shadow.buffer.GetHeapProperties(Some(&mut heap), Some(&mut flags)) }.is_ok();
+                let (start, span) = shadow.span();
+                tracing::info!(shader, kind = ?used.kind, slot = group.slot,
+                    address = format_args!("{address:#x}"), bytes,
+                    copy_start = format_args!("{start:#x}"), copy_bytes = span,
+                    carded = shadow.carded(), in_place = shadow.in_place(), queried,
+                    heap_type = heap.Type.0, cpu_page = heap.CPUPageProperty.0,
+                    memory_pool = heap.MemoryPoolPreference.0,
+                    "selected shader buffer placement");
+            }
+        }
     }
 
     /// The first draws, at debug level: what they bind and read
