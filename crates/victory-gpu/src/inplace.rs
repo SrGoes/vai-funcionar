@@ -1258,10 +1258,32 @@ fn real_part(spans: &[(u64, u64, bool)]) -> Vec<String> {
     lines
 }
 
+/// When the census runs, in seconds after the probe: `VICTORY_INPLACE_CENSUS_AT`
+/// as `300,600,900` (at most 8, rising), 30 and 150 without it. On a PC that
+/// reaches the world minutes in (16 GB, RTX 5060: 4 to 6), 150 s is a menu.
+fn census_at() -> &'static [u64] {
+    static AT: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    AT.get_or_init(|| census_times(std::env::var("VICTORY_INPLACE_CENSUS_AT").ok().as_deref()))
+}
+
+fn census_times(text: Option<&str>) -> Vec<u64> {
+    let asked: Vec<u64> = text
+        .unwrap_or("")
+        .split(',')
+        .filter_map(|s| s.trim().parse::<u64>().ok())
+        .take(8)
+        .collect();
+    if asked.is_empty() || asked.windows(2).any(|w| w[0] >= w[1]) {
+        vec![30, 150]
+    } else {
+        asked
+    }
+}
+
 /// Called once a second by the thread that submits, before a submission
 /// (`host::sweep`): with [`probe_level`], the probe at the first call, the
-/// census (on a thread of its own: it asks Windows about every copy) 30
-/// and 150 seconds later.
+/// census (on a thread of its own: it asks Windows about every copy) at
+/// the times of [`census_at`].
 pub(crate) fn tick() {
     if level() > 0 {
         say();
@@ -1288,11 +1310,7 @@ pub(crate) fn tick() {
         }
         Err(started) => started,
     };
-    let due = match DONE.load(Ordering::Relaxed) {
-        0 => now >= started + 30_000,
-        1 => now >= started + 150_000,
-        _ => false,
-    };
+    let due = census_at().get(DONE.load(Ordering::Relaxed) as usize).is_some_and(|&s| now >= started + s * 1000);
     if due {
         let which = DONE.fetch_add(1, Ordering::Relaxed);
         std::thread::spawn(move || {
@@ -1501,6 +1519,15 @@ pub(crate) mod tests {
             assert!(matches!(place_part(&device, start, len), Err(None)));
             mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
         }
+    }
+
+    /// The census times: as asked when they rise, else 30 and 150.
+    #[test]
+    fn census_times_are_asked_or_the_old_two() {
+        assert_eq!(super::census_times(None), vec![30, 150]);
+        assert_eq!(super::census_times(Some("300, 600,900")), vec![300, 600, 900]);
+        assert_eq!(super::census_times(Some("600,300")), vec![30, 150]);
+        assert_eq!(super::census_times(Some("x")), vec![30, 150]);
     }
 
     /// The census names each kind of memory.
