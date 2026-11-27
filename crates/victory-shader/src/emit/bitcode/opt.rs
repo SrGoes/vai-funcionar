@@ -175,7 +175,7 @@ fn map_operands(op: &mut Op, mut f: impl FnMut(V) -> V) {
             *a = f(*a);
             *b = f(*b);
         }
-        Op::Cast(_, v) | Op::Extract(v, _) | Op::Load(v) => *v = f(*v),
+        Op::Cast(_, v) | Op::Extract(v, _) | Op::Load(v) | Op::VolatileLoad(v) => *v = f(*v),
         Op::Select(a, b, c) | Op::CmpXchg(a, b, c) => {
             *a = f(*a);
             *b = f(*b);
@@ -703,6 +703,7 @@ impl Module {
             | Op::Select(..)
             | Op::Extract(..)
             | Op::Gep(..) => Effect::Pure,
+            Op::VolatileLoad(_) => Effect::Reads,
             Op::Load(p) => {
                 // A constant table reads the same whatever is stored.
                 let base = match *p {
@@ -743,6 +744,12 @@ impl Module {
             Op::Cmp(p, a, b) => Key::Cmp(*p, *a, *b),
             Op::Select(c, t, f) => Key::Select(*c, *t, *f),
             Op::Extract(a, n) => Key::Extract(*a, *n),
+            // A size query stays where the lowering put it: AMD's D3D12
+            // compiler (amdxc64 32.0.32029.2010, RDNA4) crashes making the
+            // pipeline of some compute programs when one `getDimensions`
+            // serves the uses of another below it (29 of the title's
+            // `CS_RaytracingResolve` programs; RDNA2 makes them either way).
+            Op::Call(f, _) if self.funcs[*f as usize].name == "dx.op.getDimensions" => return None,
             Op::Call(f, args) => Key::Call(*f, args.clone()),
             Op::Gep(ty, p, idx) => Key::Gep(*ty, *p, idx.clone()),
             Op::Load(p) => Key::Load(*p),
@@ -1500,6 +1507,29 @@ mod tests {
         assert_eq!(body(&m, then), 2);
         assert_eq!(body(&m, other), 2);
         assert_eq!(body(&m, join), 2);
+        m.write();
+    }
+
+    #[test]
+    fn a_size_query_is_not_reused() {
+        let Diamond {
+            k: Kit { mut m, b, writes, .. },
+            x,
+            y,
+            then,
+            ..
+        } = diamond();
+        let i32t = m.int(32);
+        let fty = m.func_ty(i32t, vec![i32t, i32t]);
+        m.ptr(fty);
+        let dims = m.function("dx.op.getDimensions", fty, Some(Attr::ReadOnly), false);
+        let top = m.call(b, dims, vec![x, y]);
+        m.call(b, writes, vec![top, top]);
+        let again = m.call(then, dims, vec![x, y]);
+        m.call(then, writes, vec![again, again]);
+        m.optimise(REUSE);
+        assert_eq!(stores(&m, then), [[again, again]]);
+        assert_eq!(body(&m, then), 2);
         m.write();
     }
 

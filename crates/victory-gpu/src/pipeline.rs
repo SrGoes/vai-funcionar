@@ -61,6 +61,10 @@ pub(crate) struct Shader {
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
     container: Vec<u8>,
+    /// It is left out: it animates or draws hair strands ([`hair_strands`]),
+    /// or serves rays that do not run ([`idle_without_rays`]).
+    #[cfg(windows)]
+    hair: bool,
     /// Its part in the stand-in for the indirect light.
     #[cfg(windows)]
     pub(crate) ambient: Option<crate::ambient::Role>,
@@ -100,6 +104,63 @@ pub(crate) fn kept() -> [u64; 7] {
     ]
 }
 
+/// Whether a container's program only makes sense with the title's rays,
+/// which do not run (`VICTORY_RAYS` has them run, and it with them): the
+/// program that tells the screen probes which rays to trace.
+/// shortcut: left out. The AMD driver never ended its pipeline until the
+/// clean-up passes shortened it; once it ran, with no rays behind it, the
+/// whole picture lost light, shadows and reflections.
+#[cfg(windows)]
+fn idle_without_rays(container: &[u8]) -> bool {
+    const NAME: &[u8] = b"CS_ScreenProbes_ActivateRays";
+    !victory_shader::emit::rays() && container.windows(NAME.len()).any(|w| w == NAME)
+}
+
+/// Whether a container's program is one of those that animate and draw hair
+/// strands, by its name. `VICTORY_HAIR` has them run.
+/// shortcut: left out, as some of them do not translate (an address from a
+/// phi) and the others draw lines all over the screen without them.
+#[cfg(windows)]
+fn hair_strands(container: &[u8]) -> bool {
+    static RUN: OnceLock<bool> = OnceLock::new();
+    const NAMES: [&[u8]; 18] = [
+        b"InterpolateStrand",
+        b"HairStrand",
+        b"CS_VisHair",
+        b"PS_Smh",
+        b"CS_InitSimBuffer",
+        b"CS_PreSkinSim",
+        b"CS_SolvePer",
+        b"CS_WavePerSpline",
+        b"CS_EstimateStartPosition",
+        b"CS_CachePrev",
+        b"CS_RestoreSimVelocity",
+        b"CS_UpdatePosePosition",
+        b"CS_GenerateAccessories",
+        b"CSGenerateHair",
+        b"CS_CalculateFireVolumes",
+        b"CS_ProjDecalCut",
+        b"CS_CullMaskPass",
+        b"CS_LodBlend",
+    ];
+    if *RUN.get_or_init(|| std::env::var_os("VICTORY_HAIR").is_some()) {
+        return false;
+    }
+    const END: &[u8] = b"_Wrapped";
+    container
+        .windows(END.len())
+        .enumerate()
+        .filter(|(_, w)| *w == END)
+        .any(|(at, _)| {
+            let before = &container[at.saturating_sub(100)..at];
+            let name = before
+                .rsplit(|b| !b.is_ascii_alphanumeric() && *b != b'_')
+                .next()
+                .unwrap_or_default();
+            NAMES.iter().any(|n| name.windows(n.len()).any(|w| w == *n))
+        })
+}
+
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
@@ -114,6 +175,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
                 container: bytes.to_vec(),
+                #[cfg(windows)]
+                hair: hair_strands(bytes) || idle_without_rays(bytes),
                 #[cfg(windows)]
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
                 #[cfg(windows)]
@@ -453,7 +516,7 @@ pub(crate) fn bound(this: This) {
 /// use starts that, see [`make`]).
 #[cfg(windows)]
 pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
-    if this.is_null() {
+    if this.is_null() || is_skipped(this) {
         return None;
     }
     make::ready(&pipeline(this).host)
@@ -471,7 +534,7 @@ pub(crate) fn making() -> u64 {
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 fn parse_skip_hashes(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -491,23 +554,20 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
         parse_skip_hashes(&value)
     });
-    if hashes.is_empty() {
-        return None;
-    }
     p.shaders
         .iter()
-        .find(|shader| hashes.contains(&shader.hash))
+        .find(|shader| shader.hair || !hashes.is_empty() && hashes.contains(&shader.hash))
         .map(|shader| shader.hash.as_str())
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && skipped_shader(pipeline(this)).is_some()
 }
@@ -718,9 +778,10 @@ pub(crate) extern "system" fn create_stream(
             break;
         };
         if let Some(stage) = stage {
-            // SAFETY: a shader subobject has its bytecode at +8.
-            let code = unsafe { &*desc.stream.add(at + 8).cast::<Bytecode>() };
-            shaders.extend(copy(stage, code));
+            // SAFETY: a shader subobject has its bytecode at +8, which the
+            // stream does not promise to be aligned.
+            let code = unsafe { desc.stream.add(at + 8).cast::<Bytecode>().read_unaligned() };
+            shaders.extend(copy(stage, &code));
         }
         #[cfg(windows)]
         // SAFETY: a whole subobject of this kind lies at `at`.
@@ -789,6 +850,7 @@ pub fn use_pipeline_cache(dir: std::path::PathBuf) {
 #[cfg(windows)]
 pub fn save_pipeline_cache() {
     library::save(true);
+    known::flush();
 }
 
 #[cfg(test)]
@@ -805,6 +867,31 @@ mod tests {
 
     use super::*;
     use crate::object::{S_OK, slot};
+
+    /// The slice a title's stream (or a pre-build's) is in need not be
+    /// 8-aligned: its bytecode is read as it lies.
+    #[test]
+    fn a_stream_of_any_alignment_is_read() {
+        let vs = [1u8, 2, 3];
+        let mut backing = [0u64; 5];
+        // SAFETY: the 40 bytes of `backing`, one off its (aligned) start.
+        let stream = unsafe { std::slice::from_raw_parts_mut(backing.as_mut_ptr().cast::<u8>().add(1), 32) };
+        stream[..4].copy_from_slice(&1u32.to_le_bytes()); // vertex shader
+        stream[8..16].copy_from_slice(&(vs.as_ptr() as usize).to_le_bytes());
+        stream[16..24].copy_from_slice(&vs.len().to_le_bytes());
+        assert_ne!(stream.as_ptr() as usize % 8, 0);
+        let desc = StreamDesc {
+            size: 24,
+            stream: stream.as_ptr(),
+        };
+        let mut out = std::ptr::null();
+        assert_eq!(
+            create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut out),
+            S_OK
+        );
+        assert_eq!(shaders(out), vec![("vertex", vs.to_vec())]);
+        crate::object::release_boxed::<Pipeline>(out);
+    }
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
         pipeline(p)

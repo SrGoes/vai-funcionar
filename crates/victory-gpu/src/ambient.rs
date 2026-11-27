@@ -85,6 +85,12 @@ enum Set {
 
 fn parse(set: &str) -> Set {
     let set = set.trim();
+    if set.is_empty() {
+        return Set::Estimate(1.0);
+    }
+    if set == "off" || set == "0" {
+        return Set::Off;
+    }
     let number = |t: &str| t.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0);
     match set.strip_prefix("constant:") {
         Some(level) => number(level).map_or(Set::Off, Set::Constant),
@@ -112,6 +118,73 @@ fn air() -> f32 {
     })
 }
 
+/// How the slow mean of the light around follows the frames
+/// (`VICTORY_AMBIENT_SETTLE=<time constant in ms>[,<jump factor>[,<fresh
+/// seconds>]]`; unset: 250,3; 0: 0.04 of the way a frame, as before, which is
+/// 25 frames: 0.8 s at the console's 30 frames a second, 3.5 s at 7). Set, it
+/// is the same share of the way a second whatever the frame rate, and a
+/// change by more than the jump factor (0: none) is taken at once, as a new
+/// room is. Fresh seconds (default 0: none): for that long after such a jump
+/// the light the title's own resolve left is bounded by the estimate, not
+/// four times it, rising back to four times by the end.
+///
+/// Ported from Belobug/VIctory-Belobug-AMD b4ba4bb and 9576c45 (the light
+/// probe and its stats buffer left out).
+#[derive(Clone, Copy)]
+struct Settle {
+    ms: f32,
+    jump: f32,
+    fresh: f32,
+}
+
+fn settle() -> Option<Settle> {
+    static SET: OnceLock<Option<Settle>> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let set = std::env::var("VICTORY_AMBIENT_SETTLE").unwrap_or_else(|_| "250,3".to_owned());
+        let mut parts = set.split(',').map(|p| p.trim().parse::<f32>().ok());
+        let ms = parts.next().flatten().filter(|v| v.is_finite() && *v > 0.0)?;
+        let jump = parts.next().flatten().filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(3.0);
+        let fresh = parts.next().flatten().filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(0.0);
+        tracing::info!(
+            ms,
+            jump,
+            fresh,
+            "the stand-in's mean of the light around settles by the clock (VICTORY_AMBIENT_SETTLE; 0: per frame)"
+        );
+        Some(Settle { ms, jump, fresh })
+    })
+}
+
+/// The share of the way the slow mean goes at this keeping, `dt` ms after
+/// the last ([`Role::Radiance`]; the other passes do not read it).
+fn follow(role: Role, dt: f32) -> f32 {
+    match settle() {
+        Some(settle) if role == Role::Radiance => 1.0 - (-dt / settle.ms).exp(),
+        _ => 0.04,
+    }
+}
+
+/// Milliseconds since the last keeping ([`Role::Radiance`], once a frame);
+/// the first, and after a pause of over a second, as a frame of 30. Other
+/// roles: the last answer.
+fn frame_ms(role: Role) -> f32 {
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    static DT: AtomicU32 = AtomicU32::new(0x4204_0000); // 33.0
+    if role != Role::Radiance {
+        return f32::from_bits(DT.load(Relaxed));
+    }
+    let now = crate::host::now_ms();
+    let last = LAST.swap(now, Relaxed);
+    let dt = match now.saturating_sub(last) {
+        0 => 1.0,
+        dt if last == 0 || dt > 1000 => 33.0,
+        dt => dt as f32,
+    };
+    DT.store(dt.to_bits(), Relaxed);
+    dt
+}
+
 /// Strength and radius of the creases' shade.
 fn shade() -> [f32; 2] {
     static SET: OnceLock<[f32; 2]> = OnceLock::new();
@@ -128,7 +201,7 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=12, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
+#define RS "RootConstants(num32BitConstants=15, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -138,6 +211,7 @@ cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
     float follow; float most; float air; float unused;
+    float jump; float fresh; float dt;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -166,7 +240,9 @@ void keep(uint3 at : SV_DispatchThreadID) {
     for (uint y = 0; y < 5; y++) for (uint x = 0; x < 5; x++) {
         uint2 p = uint2((float2(at.xy) + (float2(x, y) + 0.5) / 5.0) * float2(w, h) / float2(CX, CY));
         float3 c = max(radiance[p], 0.0);
-        c = any(isnan(c)) || any(isinf(c)) ? 0.0 : c;
+        // NaN or infinity: every exponent bit set (no `isnan`/`isinf`, which
+        // Wine's compiler lacks).
+        c = any((asuint(c) & 0x7f800000u) == 0x7f800000u) ? 0.0 : c;
         // Lamps and glints count, but not for everything.
         sum += c / max(1.0, dot(c, LUMA) / 20.0);
     }
@@ -179,7 +255,14 @@ void mean() {
     for (uint i = 0; i < CELLS; i++) sum += cells[i].rgb;
     float4 was = cells[CELLS];
     float3 now = sum / CELLS;
-    cells[CELLS] = float4(was.a > 0.0 ? lerp(was.rgb, now, follow) : now, 1.0);
+    // (`jump` > 0: a change of more than that factor either way is
+    // followed at once, as a new room is.)
+    float a = max(dot(now, LUMA), 1e-5), b = max(dot(was.rgb, LUMA), 1e-5);
+    bool jumped = jump > 0.0 && max(a / b, b / a) > jump;
+    // Its fourth part: seconds since the light around last jumped (from
+    // 0.001; 0: nothing kept yet).
+    float age = was.a > 0.0 && !jumped ? was.a + dt : 0.001;
+    cells[CELLS] = float4(was.a > 0.0 ? lerp(was.rgb, now, jumped ? 1.0 : follow) : now, age);
 }
 #endif
 
@@ -323,7 +406,11 @@ void raise(uint3 at : SV_DispatchThreadID) {
     float3 was = unpack(light[p]);
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
-    float top = max(dot(found, LUMA) * most, 1e-6);
+    // For `fresh` seconds after the light around jumped (a new room) the
+    // title's leftover counts for no more than the estimate, then up to
+    // `most` times it again: its history holds the place before.
+    float bound = fresh > 0.0 ? lerp(1.0, most, saturate(cells[CELLS].a / fresh)) : most;
+    float top = max(dot(found, LUMA) * bound, 1e-6);
     float has = dot(was, LUMA);
     was *= min(1.0, top / max(has, 1e-6));
     light[p] = pack(max(was, found));
@@ -359,7 +446,19 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         // SAFETY: the root signature is inside the shader; plain creations.
         unsafe {
             if root.is_none() {
-                root = Some(device.CreateRootSignature(0, &code)?);
+                // As the shader's `RS`, made here: Wine's compiler embeds none.
+                use crate::rootsig::Param;
+                root = Some(crate::rootsig::make(
+                    device,
+                    &[
+                        Param::Constants { register: 0, count: 15 },
+                        Param::SrvTable { register: 0, count: 1, visibility: D3D12_SHADER_VISIBILITY_ALL },
+                        Param::UavTable { register: 0, count: 1 },
+                        Param::Uav(1),
+                        Param::Uav(2),
+                    ],
+                    "indirect light stand-in",
+                )?);
             }
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
@@ -455,15 +554,19 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     list.keep(&pass.points);
     let [strength, radius] = shade();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
-    let mut words = [0u32; 12];
+    let mut words = [0u32; 15];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
     words[6] = views.size[0];
     words[7] = views.size[1];
-    words[8] = 0.04f32.to_bits();
+    let dt = frame_ms(role);
+    words[8] = follow(role, dt).to_bits();
     words[9] = 4.0f32.to_bits();
     words[10] = air().to_bits();
+    words[12] = settle().map_or(0.0, |s| s.jump).to_bits();
+    words[13] = settle().map_or(0.0, |s| s.fresh).to_bits();
+    words[14] = (dt / 1000.0).to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -471,7 +574,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 12, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 15, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
@@ -506,12 +609,25 @@ mod tests {
 
     #[test]
     fn settings() {
-        assert_eq!(parse(""), Set::Off);
+        assert_eq!(parse(""), Set::Estimate(1.0));
         assert_eq!(parse("off"), Set::Off);
         assert_eq!(parse("0"), Set::Off);
         assert_eq!(parse("0.8"), Set::Estimate(0.8));
         assert_eq!(parse("constant:0.3"), Set::Constant(0.3));
         assert_eq!(parse("constant:nan"), Set::Off);
+    }
+
+    /// Settled by the clock, the slow mean goes the same share of the way in
+    /// a second at 7 frames a second as at 30.
+    #[test]
+    fn the_slow_mean_follows_by_the_clock() {
+        let ms = 250.0f32;
+        let share = |dt: f32, frames: u32| 1.0 - (1.0 - (1.0 - (-dt / ms).exp())).powi(frames as i32);
+        let (slow, fast) = (share(1000.0 / 7.0, 7), share(1000.0 / 30.0, 30));
+        assert!((slow - fast).abs() < 1e-4, "{slow} {fast}");
+        // Per frame (0.04), 7 frames go 25 % of the way, 30 go 71 %.
+        let per_frame = |frames: i32| 1.0 - 0.96f32.powi(frames);
+        assert!(per_frame(7) < 0.26 && per_frame(30) > 0.7);
     }
 
     #[test]
