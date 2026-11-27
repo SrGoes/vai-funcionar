@@ -17,7 +17,7 @@ O trabalho acontece em duas máquinas, as duas com GeForce. Todo número diz de 
 
 - **Rota igual nas duas:** nvidia. Número medido pela rota amd não vale para nenhuma.
 - **O que as separa hoje é a RAM, não a placa.** O port usa 24-25 GB de RAM na máquina A com o kit da rota nvidia. Na máquina B, com 16 GB, a sessão em Series S cai depois de ~9 min (#2) e Series X não se sustenta (#3). Baixar a memória do port é o que destrava a máquina B.
-- **Perfil de console:** o `Play-VIctory.cmd` escolhe pela memória do PC (Series S abaixo de 48 GB de RAM ou 12 GB de VRAM) e aceita `series-s` ou `series-x` como primeira palavra. Até 27/11 ele forçava Series X. Nada foi medido em Series X na máquina A.
+- **Perfil de console:** o `Play-VIctory.cmd` escolhe pela memória do PC (Series S abaixo de 48 GB de RAM ou 12 GB de VRAM) e aceita `series-s` ou `series-x` como primeira palavra. Antes do PR #49 ele forçava Series X. Nada foi medido em Series X na máquina A.
 - As duas placas têm folga para o jogo: na máquina A a placa fica 43-54% ocupada e quem limita o FPS é o processador preparando cada quadro (ver abaixo).
 
 ## O que entrou na main em 27/11 (PRs #31 a #34)
