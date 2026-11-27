@@ -6367,8 +6367,12 @@ impl Host {
             batch.refresh_ahead(runs, |list, i| own.as_ref().is_some_and(|own| own.takes(list, i)));
         }
         stage.next("submit: the lists' steps");
-        for (_run, list) in runs.iter().enumerate() {
+        for list in runs {
             list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
+            // (This run's place among the submission's: `firsts` has one
+            // entry per run so far.)
+            #[cfg(feature = "diagnostics")]
+            let run = firsts.len();
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
                 #[cfg(feature = "diagnostics")]
@@ -6380,7 +6384,7 @@ impl Host {
                 lists.len(),
                 match &own {
                     Some(own) if std::ptr::eq(own.list(), *list) => crate::copystat::Timed::Steps,
-                    _ => crate::copystat::Timed::Title(_run),
+                    _ => crate::copystat::Timed::Title(run),
                 },
             ));
             lists.push(list.list.cast().ok());
