@@ -4617,7 +4617,9 @@ fn make_twinned(
                 if copy.base > 0
                     && let Some(desc) = &mut desc
                 {
-                    from_base(desc, copy.base);
+                    // SAFETY: a live resource.
+                    let own_mips = u32::from(unsafe { texture.GetDesc() }.MipLevels);
+                    from_base(desc, copy.base, own_mips);
                 }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
@@ -4759,18 +4761,38 @@ fn make_twinned(
 /// The view `desc` of a texture, of a host copy of its levels from `base`
 /// on (`crate::resource::held_only`). What it shows of larger ones, if any,
 /// is left out.
-fn from_base(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, base: u32) {
-    if desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D {
-        return;
+///
+/// The view stays inside the host copy's own `own_mips` levels (0: not
+/// known), and a 2D array view of a 2D texture counts the same way: such a
+/// view was left as the title made it, past the levels the copy has.
+fn from_base(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, base: u32, own_mips: u32) {
+    let clamp_mips = |most: &mut u32, levels: &mut u32, lod: &mut f32| {
+        let lost = base.saturating_sub(*most);
+        *most = most.saturating_sub(base);
+        if own_mips > 0 {
+            *most = (*most).min(own_mips - 1);
+        }
+        if *levels != u32::MAX {
+            *levels = levels.saturating_sub(lost).max(1);
+            if own_mips > 0 {
+                *levels = (*levels).min(own_mips.saturating_sub(*most)).max(1);
+            }
+        }
+        *lod = (*lod - base as f32).max(0.0);
+    };
+    match desc.ViewDimension {
+        D3D12_SRV_DIMENSION_TEXTURE2D => {
+            // SAFETY: the member its dimension says.
+            let t = unsafe { &mut desc.Anonymous.Texture2D };
+            clamp_mips(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+        }
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+            // SAFETY: the member its dimension says.
+            let t = unsafe { &mut desc.Anonymous.Texture2DArray };
+            clamp_mips(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+        }
+        _ => {}
     }
-    // SAFETY: the member its dimension says.
-    let t = unsafe { &mut desc.Anonymous.Texture2D };
-    let lost = base.saturating_sub(t.MostDetailedMip);
-    t.MostDetailedMip = t.MostDetailedMip.saturating_sub(base);
-    if t.MipLevels != u32::MAX {
-        t.MipLevels = t.MipLevels.saturating_sub(lost).max(1);
-    }
-    t.ResourceMinLODClamp = (t.ResourceMinLODClamp - base as f32).max(0.0);
 }
 
 /// Writes of a slot with another view of the placed texture it showed,
@@ -5269,7 +5291,7 @@ mod tests {
         let view = |first, levels, clamp| {
             let mut desc = srv_desc(&[98, 4, 5768, 0, first, levels, 0, 0, 0, 0]);
             desc.Anonymous.Texture2D.ResourceMinLODClamp = clamp;
-            from_base(&mut desc, 3);
+            from_base(&mut desc, 3, 10);
             // SAFETY: the member its dimension says.
             let t = unsafe { desc.Anonymous.Texture2D };
             (t.MostDetailedMip, t.MipLevels, t.ResourceMinLODClamp)
@@ -5278,6 +5300,38 @@ mod tests {
         assert_eq!(view(5, u32::MAX, 5.5), (2, u32::MAX, 2.5));
         // (Two levels the copy has not.)
         assert_eq!(view(1, 4, 0.0), (0, 2, 0.0));
+    }
+
+    /// A view never reaches past the levels the host copy has, and a 2D
+    /// array view of it counts from its first level as a 2D view does.
+    #[test]
+    fn views_stay_inside_the_host_copys_levels() {
+        // A copy from level 3 of 8 has 5 levels: a view of levels 4-7 shows
+        // its levels 1-4, and one asking for 6 levels from level 3 gets 5.
+        let mut desc = srv_desc(&[98, 4, 5768, 0, 4, 4, 0, 0, 0, 0]);
+        from_base(&mut desc, 3, 5);
+        // SAFETY: the member its dimension says.
+        let t = unsafe { desc.Anonymous.Texture2D };
+        assert_eq!((t.MostDetailedMip, t.MipLevels), (1, 4));
+        let mut desc = srv_desc(&[98, 4, 5768, 0, 3, 6, 0, 0, 0, 0]);
+        from_base(&mut desc, 3, 5);
+        // SAFETY: the member its dimension says.
+        let t = unsafe { desc.Anonymous.Texture2D };
+        assert_eq!((t.MostDetailedMip, t.MipLevels), (0, 5));
+        let mut desc = srv_desc(&[98, 4, 5768, 0, 4, 4, 0, 0, 0, 0]);
+        desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+        desc.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_SRV {
+            MostDetailedMip: 4,
+            MipLevels: 4,
+            FirstArraySlice: 0,
+            ArraySize: 1,
+            PlaneSlice: 0,
+            ResourceMinLODClamp: 4.0,
+        };
+        from_base(&mut desc, 3, 5);
+        // SAFETY: the member its dimension says.
+        let a = unsafe { desc.Anonymous.Texture2DArray };
+        assert_eq!((a.MostDetailedMip, a.MipLevels, a.ResourceMinLODClamp), (1, 4, 1.0));
     }
 
     /// 2D textures and arrays have a neutral stand-in, others a null view.
