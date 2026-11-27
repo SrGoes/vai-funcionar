@@ -10057,7 +10057,15 @@ impl Meter {
             1 => format!(" | VIctory-NVIDIA {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame"),
             per => format!(" | VIctory-NVIDIA {fps:.0} fps (frame gen {:.0} fps) {ms:.1} ms/frame {draws:.0} draws/frame", fps * f64::from(per)),
         };
-        let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
+        // `VICTORY_WINDOW_LABEL=<text>`: first in the window's text, to tell one
+        // run's window from another's.
+        static LABEL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let label = LABEL.get_or_init(|| match std::env::var("VICTORY_WINDOW_LABEL") {
+            Ok(label) if !label.is_empty() => format!("[{label}] "),
+            _ => String::new(),
+        });
+        let mut text: Vec<u16> =
+            label.encode_utf16().chain(caption.iter().copied()).chain(text.encode_utf16()).collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
         // which may not pump for a while), so a thread of ours does it and
