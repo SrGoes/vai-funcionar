@@ -378,6 +378,10 @@ struct Lower<'a> {
     mask_ok: bool,
     /// Ballots of masks read as data, by low dword: (low, high).
     ballots: HashMap<Value, (V, V)>,
+    /// With half-meets: ballots of masks written in an earlier block, exchanged where they
+    /// are read ([`Lower::exchange_block`]), by low dword and the IR block that reads them.
+    /// The pair is made after a meet in that block, which does not dominate the others.
+    met_ballots: HashMap<(Value, usize), (V, V)>,
     /// Masks whose ballot is being built: a mask whose lane bit needs its
     /// own value as a number (an opaque mask keyed by a dword it shares
     /// with another) would otherwise recurse until the stack overflows.
@@ -2120,6 +2124,7 @@ impl<'a> Lower<'a> {
             },
             mask_ok: false,
             ballots: HashMap::new(),
+            met_ballots: HashMap::new(),
             balloting: HashSet::new(),
             def_block: p
                 .blocks
@@ -3989,8 +3994,9 @@ impl<'a> Lower<'a> {
             }
             return Err(MASK_ELSEWHERE);
         }
-        let (x, y) = match self.ballots.get(&lo) {
-            Some(&xy) => xy,
+        let cached = self.ballots.get(&lo).or_else(|| self.met_ballots.get(&(lo, self.cur_ir))).copied();
+        let (x, y) = match cached {
+            Some(xy) => xy,
             None => {
                 let at = match self.def_block.get(&lo) {
                     // Program inputs (EXEC on entry).
@@ -4011,6 +4017,7 @@ impl<'a> Lower<'a> {
                     .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
                 self.s.flags |= flags::WAVE_OPS;
                 let mut xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
+                let mut met = false;
                 if self.exchange.is_some() {
                     // a host wave's ballot is its half's 32 bits: the halves exchange them
                     let b = self.def_block.get(&lo).copied();
@@ -4023,9 +4030,15 @@ impl<'a> Lower<'a> {
                         need(b.unwrap_or(0));
                         return Err(DIVERGENT_MASK_EXCHANGE);
                     }
-                    xy = self.exchange_halves(at, b, xy.0)?;
+                    let (there, barrier) = self.exchange_block(at, b);
+                    met = there != at;
+                    xy = self.exchange_halves(there, barrier, xy.0)?;
                 }
-                self.ballots.insert(lo, xy);
+                if met {
+                    self.met_ballots.insert((lo, self.cur_ir), xy);
+                } else {
+                    self.ballots.insert(lo, xy);
+                }
                 xy
             }
         };
@@ -4662,7 +4675,7 @@ impl<'a> Lower<'a> {
                 self.meet_refuse = Some("a half-meet where not every lane runs");
             }
             block
-        } else if block != self.cur {
+        } else if block != self.cur || self.s.m.is_terminated(block) {
             // A meet ends `block` and goes on in a block of its own: only the block
             // being lowered can be ended so. Another one (where a lane mask read later
             // was written, `mask_dword` and `scc_some`) is closed already, and its end
@@ -4882,7 +4895,13 @@ impl<'a> Lower<'a> {
         let lds = self.s.lds();
         let ptr = self.s.m.element(at, lds, index);
         self.s.m.store(at, ptr, mine);
-        let at = self.order_waves(at, self.reached_by_group());
+        // Whether the whole group meets here is a matter of the block the exchange is in,
+        // which need not be the one being lowered ([`Lower::exchange_block`]).
+        let everyone = barrier_block.map_or_else(
+            || at == self.s.entry || self.reached_by_group(),
+            |b| self.group_all.get(b).copied().unwrap_or(false),
+        );
+        let at = self.order_waves(at, everyone);
         let one = self.s.m.i32(1);
         let k1 = self.s.m.bin(at, Bin::Add, pair, one);
         let p0 = self.s.m.element(at, lds, pair);
@@ -4890,8 +4909,34 @@ impl<'a> Lower<'a> {
         let lo = self.s.m.load(at, p0);
         let hi = self.s.m.load(at, p1);
         // the slots are written again only after every thread read them
-        let _at = self.order_waves(at, self.reached_by_group());
+        let _at = self.order_waves(at, everyone);
         Ok((lo, hi))
+    }
+
+    /// Where the halves exchange a value made in `at`, a block of IR block `made` (none: the
+    /// entry), and the IR block that must have every lane for that: (block, IR block).
+    ///
+    /// `at`, where a group barrier orders the exchange: it goes in a block already closed as
+    /// well as in the open one. A half-meet ends the block it is in and goes on in a block of
+    /// its own ([`Lower::half_meet_at`]), which only the open block can do: a value made in
+    /// an earlier block (a lane mask read as data, the SCC of a mask operation) is exchanged in
+    /// the open block instead. That block is dominated by `at`, so the half's value (the
+    /// same in all its lanes, taken where the lanes of `made` ran) is there, and the whole
+    /// exchange (store, meet, loads, meet) stands together: no other exchange of the wave
+    /// comes between its store and its loads. Both halves must run the open block
+    /// ([`Lower::order_waves`] refuses the meet otherwise), and every lane for the barrier
+    /// check of [`Lower::exchange_halves`].
+    ///
+    /// Where every thread of the group runs `made` (the entry, say) the exchange stays there,
+    /// ordered by a group barrier, which closes no block ([`Lower::exchange_halves`] asks the
+    /// participation of that block, not of the one being lowered; after cool_fox PR #53).
+    fn exchange_block(&self, at: usize, made: Option<usize>) -> (usize, Option<usize>) {
+        let group = made.is_none_or(|b| self.group_all.get(b).copied().unwrap_or(false));
+        if self.half_meet && at != self.cur && !group {
+            (self.cur, Some(self.cur_ir))
+        } else {
+            (at, made)
+        }
     }
 
     /// The first of the two exchange dwords of this thread's console wave (made in the entry
@@ -4947,7 +4992,8 @@ impl<'a> Lower<'a> {
             return Err(DIVERGENT_MASK_EXCHANGE);
         }
         let some = self.s.m.cast(at, Cast::ZExt, some, i32t);
-        let (lo, hi) = self.exchange_halves(at, made, some)?;
+        let (there, barrier) = self.exchange_block(at, made);
+        let (lo, hi) = self.exchange_halves(there, barrier, some)?;
         let at = self.sync_block;
         let both = self.s.m.bin(at, Bin::Or, lo, hi);
         let z = self.s.m.i32(0);
@@ -13756,10 +13802,11 @@ mod tests {
 
     /// A lane mask written where every lane runs and read as a number inside a region only
     /// some waves of the group run: its ballot is taken in the block that wrote it, which is
-    /// closed by then, and the halves would meet there. That is refused (issue #30: the meet
-    /// took that block's end, and the writer later found a use of a value never emitted).
+    /// closed by then. The halves exchange it there, at group barriers, since the whole group
+    /// runs the entry (issue #30: a meet in the closed block took its end, and the writer later found a use of
+    /// a value never emitted; then such a meet was refused, and the program with it).
     #[test]
-    fn half_meet_in_a_closed_block_is_refused() {
+    fn a_mask_written_before_is_exchanged_where_it_is_read() {
         let words = [
             0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
             0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
@@ -13816,13 +13863,12 @@ mod tests {
             })
         });
         super::TEST_HOST_WAVE.set(was);
-        // (On b2184b1 this lowered: while IR block 1 was lowered, the meet went into the
-        // tail of the block that wrote the mask, and took that tail's end.)
-        match lowered {
-            Ok(_) => panic!("lowered with a meet in a block already closed"),
-            Err(crate::ShaderError::Unsupported { what, .. }) => assert_eq!(what, super::HALF_MEET_CLOSED),
-            Err(e) => panic!("unexpected {e}"),
-        }
+        // (On b2184b1 this lowered with the meet in the closed block; on 36b998b it was
+        // refused, "a half-meet in a block already closed".) The mask is written in the
+        // entry, which the whole group runs: the exchange is there, at group barriers.
+        let lowered = lowered.expect("lowered, with the exchange where the mask is written");
+        assert_eq!(lowered.wave_size, Some(32));
+        assert!(lowered.group_barriers >= 2, "no group barrier ordered the exchange");
     }
 
     /// A minimum and then an add on one LDS word are not interchangeable

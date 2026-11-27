@@ -977,3 +977,106 @@ fn a_parked_pair_another_save_or_restore_shares_stays_two_scalars() {
         assert!(!instructions(&p, "s_mov_b32").is_empty(), "{name}");
     }
 }
+
+/// Two console waves of 64 (a group of 128) on a host of 32-lane waves, with half-meets. The
+/// lanes below s0 take `if (t < s0)` (taken wave-wide: by a console wave together, the other
+/// wave of the group not at all when s0 <= 64), and inside it read VCC, written before the
+/// branch, as two numbers, which each lane stores at dwords 2t and 2t + 1. On the console that
+/// is the mask of the lanes of its wave below s0 (issue #30: the halves exchange their ballots
+/// in the branch, where the mask is read, not in the block that wrote it).
+#[test]
+fn a_mask_read_after_its_block_is_the_consoles_on_two_waves_that_meet_on_their_own() {
+    let words = [
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0007, // s_cbranch_execz to the restore of EXEC
+        0x7E02_026A, // v_mov_b32 v1, vcc_lo
+        0x7E04_026B, // v_mov_b32 v2, vcc_hi
+        0x3406_0083, // v_lshlrev_b32 v3, 3, v0
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 1 << 8 | 3, // buffer_store_dword v1, v3, s[8:11], 0 offen
+        0x38 << 26 | 0x1C << 18 | 1 << 12 | 4,
+        0x80 << 24 | 2 << 16 | 2 << 8 | 3, // buffer_store_dword v2, v3, s[8:11], 0 offen offset:4
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+    ];
+    let native = native_of(&words, true, 128);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let branch = p
+        .blocks
+        .iter()
+        .position(|b| b.insts.iter().any(|i| i.name() == "s_cbranch_execz"))
+        .expect("the branch");
+    let shader = lower::with_half_meets(|| lowered(&native, &p, &HashSet::from([branch])))
+        .expect("lowered to waves of 32 with half-meets");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for below in [0u32, 20, 40, 64, 100, 128] {
+        let Some(got) = whole_uav(&shader, [below, 0], 256) else { return };
+        for t in 0..128u32 {
+            let wave = t / 64;
+            let mask: u64 = (0..64u32).filter(|l| wave * 64 + l < below).fold(0, |m, l| m | 1 << l);
+            let want = if t < below { [mask as u32, (mask >> 32) as u32] } else { [0, 0] };
+            let at = 2 * t as usize;
+            assert_eq!([got[at], got[at + 1]], want, "thread {t}, s0 = {below}");
+        }
+    }
+    eprintln!("ran on the hardware device: each wave's mask, bit for bit");
+}
+
+/// As [`a_mask_read_after_its_block_is_the_consoles_on_two_waves_that_meet_on_their_own`], with
+/// the mask written inside an outer branch (`t < s1`) that not every thread of the group runs,
+/// and read in an inner one (`t < s0`): the halves cannot meet where it was written (that
+/// block is closed, and the group does not meet there), so they exchange where it is read.
+/// The mask is of the lanes below both limits (v_cmp leaves the lanes outside EXEC clear).
+#[test]
+fn a_mask_written_in_a_branch_is_exchanged_where_a_nested_branch_reads_it() {
+    let words = [
+        0x7D88_0001, // v_cmp_gt_u32 vcc, s1, v0
+        0xBE8E_246A, // s_and_saveexec_b64 s[14:15], vcc
+        0xBF88_000B, // s_cbranch_execz to the outer restore of EXEC
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0007, // s_cbranch_execz to the inner restore of EXEC
+        0x7E02_026A, // v_mov_b32 v1, vcc_lo
+        0x7E04_026B, // v_mov_b32 v2, vcc_hi
+        0x3406_0083, // v_lshlrev_b32 v3, 3, v0
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 1 << 8 | 3, // buffer_store_dword v1, v3, s[8:11], 0 offen
+        0x38 << 26 | 0x1C << 18 | 1 << 12 | 4,
+        0x80 << 24 | 2 << 16 | 2 << 8 | 3, // buffer_store_dword v2, v3, s[8:11], 0 offen offset:4
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0xBEFE_040E, // s_mov_b64 exec, s[14:15]
+    ];
+    let native = native_of(&words, true, 128);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let branches: HashSet<usize> = p
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| b.insts.iter().any(|i| i.name() == "s_cbranch_execz"))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(branches.len(), 2, "the two branches");
+    let shader = lower::with_half_meets(|| lowered(&native, &p, &branches))
+        .expect("lowered to waves of 32 with half-meets");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (below, outer) in [(20u32, 40u32), (40, 20), (30, 64), (64, 100), (100, 40), (100, 128), (0, 128), (128, 128)] {
+        let Some(got) = whole_uav(&shader, [below, outer], 256) else { return };
+        let limit = below.min(outer);
+        for t in 0..128u32 {
+            let wave = t / 64;
+            let mask: u64 = (0..64u32).filter(|l| wave * 64 + l < limit).fold(0, |m, l| m | 1 << l);
+            let want = if t < limit { [mask as u32, (mask >> 32) as u32] } else { [0, 0] };
+            let at = 2 * t as usize;
+            assert_eq!([got[at], got[at + 1]], want, "thread {t}, s0 = {below}, s1 = {outer}");
+        }
+    }
+    eprintln!("ran on the hardware device: each wave's mask, bit for bit, exchanged in the inner branch");
+}
