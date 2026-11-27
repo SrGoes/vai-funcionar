@@ -1,0 +1,32 @@
+{
+ "route": "nvidia",
+ "build": "diag",
+ "console": "series-s",
+ "reps": 3,
+ "retries": 2,
+ "settle_s": 20,
+ "sample_s": 75,
+ "warmup": true,
+ "common": "VICTORY_HAIR=1;VICTORY_PIPELINE_BOOK=1",
+ "configs": [
+  {
+   "name": "base",
+   "vars": ""
+  },
+  {
+   "name": "upload-ahead-off",
+   "vars": "VICTORY_UPLOAD_AHEAD=0"
+  },
+  {
+   "name": "wave-wide-off",
+   "vars": "VICTORY_WAVE_WIDE=0",
+   "warm_key": "wave-wide-off"
+  },
+  {
+   "name": "amd-route",
+   "vars": "",
+   "route": "amd",
+   "safe": true
+  }
+ ]
+}
