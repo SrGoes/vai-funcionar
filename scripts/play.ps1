@@ -21,6 +21,9 @@
 #               tattoos black in the prison corridor and frames were longer with it (median
 #               170 against 159 ms, p90 424 against 206; runs 05 and 07, docs/bug-journal.md).
 #               The nvidia kit has it on already.
+# victory-settings.txt  what the F1 menu in the game saved (VICTORY_*=value lines; VICTORY_MENU_CONSOLE is
+#               the console): applied over the route's kit at every start, under -More, -Vars and -Console.
+#               Delete the file (or "RESET ALL" in the menu) to go back to the kit.
 # -DryRun       prints the settings and the command, and starts nothing
 # Every VICTORY_* setting left over in this window goes first (VICTORY_CONFIG, VICTORY_GAME_DIR,
 # VICTORY_CACHE_DIR and VICTORY_DATA_DIR stay): the kit printed is the whole kit the title runs with.
@@ -117,6 +120,23 @@ if ($Route -eq 'amd') {
 if ($UploadAhead) { $settings.VICTORY_UPLOAD_AHEAD = '1' }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 if ($Hair) { $settings.VICTORY_HAIR = '1' }
+# What the F1 menu saved (victory-settings.txt at the repository's root, git-ignored) goes over the kit and
+# under -More and -Vars; an empty value unsets the setting. VICTORY_MENU_CONSOLE is this script's own (-Console).
+$menuFile = Join-Path (Resolve-Path (Join-Path $PSScriptRoot '..')).Path 'victory-settings.txt'
+$settings.VICTORY_MENU_FILE = $menuFile
+if (Test-Path $menuFile) {
+    foreach ($saved in Get-Content $menuFile) {
+        $name, $value = $saved.Split('=', 2)
+        $name = $name.Trim()
+        if ($null -eq $value -or $name -notlike 'VICTORY_*') { continue }
+        $value = $value.Trim()
+        if ($name -eq 'VICTORY_MENU_CONSOLE') {
+            if (($value -in 'auto', 'series-s', 'series-x') -and -not $PSBoundParameters.ContainsKey('Console')) { $Console = $value }
+        } elseif ($value -eq '') { $settings.Remove($name) }
+        else { $settings[$name] = $value }
+    }
+}
+$settings.VICTORY_MENU_CONSOLE = $Console
 foreach ($k in $More.Keys) { $settings[$k] = [string]$More[$k] }
 foreach ($pair in $Vars.Split(';', [StringSplitOptions]::RemoveEmptyEntries)) {
     $name, $value = $pair.Split('=', 2)

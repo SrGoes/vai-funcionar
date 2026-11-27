@@ -13,6 +13,8 @@
 
 # Local configuration (contains paths to YOUR files)
 /victory.toml
+# What the F1 menu saved (scripts/play.ps1 applies it)
+/victory-settings.txt
 # Per-machine agent notes (local paths)
 /CLAUDE.local.md
 
