@@ -99,6 +99,10 @@ if ($Route -eq 'amd') {
         VICTORY_EXACT_LAZY = '1'; VICTORY_COPY_BY_RANGE = '1'; VICTORY_FLUSH_GROUPED = '1'
         VICTORY_CARD_STEPS_JOIN = '1'
         VICTORY_PORT_GUARD = '1'; VICTORY_PORT_GUARD_PLAN = '1'; VICTORY_ASK_NORESET = '1'
+        # The EXACT map's hits under a shared lock, and a miss's buffer made with
+        # the map unlocked: with EXACT_LAZY the lock still had 70% of the waiting
+        # inside the recording threads' long list calls (RTX 5060, timeline, 27/11).
+        VICTORY_EXACT_SPLIT = '1'
     }
     if ($LowMemory) {
         # Play-VIctory-4GB.cmd: the estimate (not the constant), the guard at its

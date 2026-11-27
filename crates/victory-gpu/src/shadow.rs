@@ -5633,15 +5633,47 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
 }
 
 /// Copies of single buffer views' own bytes ([`exact`]), by (start,
-/// bytes), each with the asking that last took it; the askings so far; and
-/// the misses since the last look for idle ones ([`sweep_due`]).
-#[allow(clippy::type_complexity)]
-static EXACT: Mutex<(u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>, u64)> = Mutex::new((0, BTreeMap::new(), 0));
+/// bytes), each with the asking that last took it ([`EXACT_TICK`]).
+type ExactMap = BTreeMap<(u64, u64), (Arc<Shadow>, AtomicU64)>;
+static EXACT: RwLock<ExactMap> = RwLock::new(BTreeMap::new());
+
+/// The askings so far, and the misses since the last look for idle copies
+/// ([`sweep_due`]).
+static EXACT_TICK: AtomicU64 = AtomicU64::new(0);
+static EXACT_MISSES: AtomicU64 = AtomicU64::new(0);
+
+/// Whether [`exact`] finds copies under the map's read lock and makes a new
+/// copy's buffer with the map unlocked (`VICTORY_EXACT_SPLIT=1`; off by
+/// default: every asking holds the map alone, as before).
+///
+/// A timeline of the title's recording threads (RTX 5060, 27/11, `-SmallRam`)
+/// had 94% of the waiting inside their long list calls on this map's lock
+/// (1,213 ms over 3 frames, from `buffer_copy` and `buffer_srv`); with
+/// `VICTORY_EXACT_LAZY` 70% (975 ms). 1,500 to 2,200 askings a frame, 300 to
+/// 400 of them misses: the hits waited behind each miss's buffer, made or
+/// zeroed under the lock, and behind its sweep. Here a hit takes the lock
+/// shared; a miss takes it alone to look again and sweep, lets it go to make
+/// or zero the buffer, and takes it again to put the copy in. If another
+/// thread put one in for the same bytes meanwhile, that one is given and the
+/// buffer made here goes to the spares, as one no submission ever named.
+fn exact_split() -> bool {
+    #[cfg(test)]
+    if exact_tests::SPLIT.load(Ordering::Relaxed) {
+        return true;
+    }
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_EXACT_SPLIT") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_EXACT_SPLIT").is_ok_and(|v| v.trim() == "1"))
+}
 
 /// Since the last frame line: askings for such copies, copies made in a
-/// buffer made for them, and copies made in a buffer another one let go
-/// ([`EXACT_SPARE`]).
-static EXACT_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// buffer made for them, copies made in a buffer another one let go
+/// ([`EXACT_SPARE`]), and misses that found the copy put in by another
+/// thread while they made a buffer ([`exact_split`]).
+static EXACT_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// Whether [`exact`] looks for idle copies once every [`LAZY_MISSES`] misses
 /// instead of at each one (`VICTORY_EXACT_LAZY=1`; off by default). Each look
@@ -5783,18 +5815,26 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         return None;
     }
     EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
-    let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
-    let (tick, map, misses) = &mut *guard;
-    *tick += 1;
-    let now = *tick;
-    if let Some((shadow, used)) = map.get_mut(&(address, len)) {
-        *used = now;
-        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
-        return Some(shadow.clone());
+    let now = EXACT_TICK.fetch_add(1, Ordering::Relaxed) + 1;
+    let key = (address, len);
+    let hit = |map: &ExactMap| {
+        map.get(&key).map(|(shadow, used)| {
+            used.store(now, Ordering::Relaxed);
+            shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+            shadow.clone()
+        })
+    };
+    let split = exact_split();
+    if split && let Some(shadow) = hit(&EXACT.read().unwrap_or_else(|e| e.into_inner())) {
+        return Some(shadow);
     }
-    *misses += 1;
-    if sweep_due(map.len(), *misses, exact_lazy()) {
-        *misses = 0;
+    let mut map = EXACT.write().unwrap_or_else(|e| e.into_inner());
+    if let Some(shadow) = hit(&map) {
+        return Some(shadow);
+    }
+    let misses = EXACT_MISSES.fetch_add(1, Ordering::Relaxed) + 1;
+    if sweep_due(map.len(), misses, exact_lazy()) {
+        EXACT_MISSES.store(0, Ordering::Relaxed);
         // Held by the map alone, and its buffer by the copy alone (no slot
         // shows it), and not asked for lately. A list not yet sent holds the
         // copy (its `Arc`), and that keeps it here; one let go was at most in
@@ -5804,8 +5844,9 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         let mut spares = exact_reuse().then(|| EXACT_SPARE.lock().unwrap_or_else(|e| e.into_inner()));
         map.retain(|_, (shadow, used)| {
             // The cheap tests first: `references` is an AddRef and a Release.
-            let keep =
-                *used + LATELY > now || Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1;
+            let keep = used.load(Ordering::Relaxed) + LATELY > now
+                || Arc::strong_count(shadow) > 1
+                || crate::host::references(&shadow.buffer) > 1;
             if !keep && let Some(spares) = &mut spares {
                 let spare = Spare { buffer: shadow.buffer.clone(), data: shadow.data as usize };
                 spares.put(shadow.width(), spare, after, SPARE_MOST);
@@ -5813,6 +5854,8 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
             keep
         });
     }
+    // Split: the buffer is made or zeroed with the map unlocked.
+    let held = (!split).then_some(map);
     let width = len.next_multiple_of(256);
     let spare = if exact_reuse() {
         let finished = crate::host::submissions().1;
@@ -5836,10 +5879,22 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         }
     };
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
+    let mut map = held.unwrap_or_else(|| EXACT.write().unwrap_or_else(|e| e.into_inner()));
+    if split && let Some(shadow) = hit(&map) {
+        // Another thread put a copy of these bytes in while this one made
+        // its buffer: no submission names this one, so any copy may take it.
+        drop(map);
+        if exact_reuse() {
+            let spare = Spare { buffer, data: data as usize };
+            EXACT_SPARE.lock().unwrap_or_else(|e| e.into_inner()).put(width, spare, 0, SPARE_MOST);
+        }
+        EXACT_STATS[3].fetch_add(1, Ordering::Relaxed);
+        return Some(shadow);
+    }
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
-    map.insert((address, len), (shadow.clone(), now));
+    map.insert(key, (shadow.clone(), AtomicU64::new(now)));
     OWN_MADE.fetch_add(1, Ordering::Relaxed);
     Some(shadow)
 }
@@ -5851,25 +5906,32 @@ pub(crate) static OWN_MADE: AtomicU64 = AtomicU64::new(0);
 /// bytes ([`exact`]), per frame over `frames`, and the copies kept now.
 /// Nothing while there are none.
 pub(crate) fn exact_line(frames: f64) {
-    let [asked, made, reused] = [0, 1, 2].map(|i| EXACT_STATS[i].swap(0, Ordering::Relaxed));
+    let [asked, made, reused, raced] = [0, 1, 2, 3].map(|i| EXACT_STATS[i].swap(0, Ordering::Relaxed));
     if asked == 0 {
         return;
     }
-    let kept = EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.len();
+    let kept = EXACT.read().unwrap_or_else(|e| e.into_inner()).len();
     tracing::info!(
         "buffer views off their copy's elements (they were refused and read zeros; VICTORY_VIEW_BYTES=0 refuses them again): \
-         {:.1} asked for per frame, {:.1} copies of their own bytes made per frame in new buffers and {:.1} in buffers let go before (VICTORY_VIEW_BYTES_REUSE=0: all new), {kept} kept",
+         {:.1} asked for per frame, {:.1} copies of their own bytes made per frame in new buffers and {:.1} in buffers let go before (VICTORY_VIEW_BYTES_REUSE=0: all new), {kept} kept; \
+         {:.1} a frame found put in by another thread while this one made its buffer (VICTORY_EXACT_SPLIT)",
         asked as f64 / frames,
         made as f64 / frames,
-        reused as f64 / frames
+        reused as f64 / frames,
+        raced as f64 / frames
     );
 }
 
 #[cfg(test)]
 mod exact_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering::Relaxed;
 
-    use super::{EXACT_STATS, Spares, exact, host, sweep_due};
+    use super::{EXACT, EXACT_STATS, Spares, exact, host, sweep_due};
+
+    /// Turns [`super::exact_split`] on for a test.
+    pub(super) static SPLIT: AtomicBool = AtomicBool::new(false);
 
     /// The sweep of the copies waits for 64 misses when lazy, but never past
     /// the ceiling; below the first threshold it never runs.
@@ -5958,6 +6020,68 @@ mod exact_tests {
         // The copies are kept for 512 askings and looked over from 256 on:
         // some 2 frames' worth are made before the first ones go.
         assert!(made <= 3 * VIEWS, "{made} buffers made: those let go were not taken");
+    }
+
+    /// With the split lock ([`super::exact_split`]): eight threads asking for
+    /// the same views at once get one copy per view, the same one each, and
+    /// it reads zeros until refreshed. Needs a host GPU; run alone, as the
+    /// one above: `--ignored --test-threads=1`.
+    #[test]
+    #[ignore = "host GPU: run alone, --ignored --test-threads=1"]
+    fn gpu_threads_asking_for_the_same_views_get_one_copy_each() {
+        if host().is_none() {
+            eprintln!("skipped: no host GPU here");
+            return;
+        }
+        SPLIT.store(true, Relaxed);
+        const THREADS: usize = 8;
+        const VIEWS: u64 = 400;
+        let memory = vec![0u64; 1 << 16];
+        let start = (memory.as_ptr() as u64).next_multiple_of(4096) + 12;
+        let barrier = std::sync::Barrier::new(THREADS);
+        let raced_before = EXACT_STATS[3].load(Relaxed);
+        // The copies are held, as a list that recorded them holds them: one
+        // only the map holds goes in a sweep once not asked for lately.
+        let got: Vec<Vec<Arc<super::Shadow>>> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..THREADS)
+                .map(|t| {
+                    let barrier = &barrier;
+                    s.spawn(move || {
+                        barrier.wait();
+                        // Each thread walks the views from another place, so
+                        // that misses on the same bytes meet.
+                        (0..VIEWS)
+                            .map(|i| {
+                                let at = start + ((i + t as u64 * 37) % VIEWS) * 64;
+                                let copy = exact(at, 48).expect("a copy");
+                                assert_eq!(copy.span(), (at, 48));
+                                // SAFETY: the copy's own mapping, 256 bytes.
+                                let bytes = unsafe { std::slice::from_raw_parts(copy.data, 48) };
+                                assert!(bytes.iter().all(|b| *b == 0), "a copy not refreshed yet reads zeros");
+                                copy
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().expect("a thread")).collect()
+        });
+        SPLIT.store(false, Relaxed);
+        eprintln!(
+            "{} askings from {THREADS} threads: {} misses found the copy put in by another thread meanwhile",
+            THREADS as u64 * VIEWS,
+            EXACT_STATS[3].load(Relaxed) - raced_before
+        );
+        // The same view is the same copy whichever thread asked.
+        for t in 1..THREADS {
+            for i in 0..VIEWS as usize {
+                let a = &got[0][i];
+                let b = &got[t][(i + VIEWS as usize - (t * 37) % VIEWS as usize) % VIEWS as usize];
+                assert!(Arc::ptr_eq(a, b), "view {i}: thread {t} got another copy");
+            }
+        }
+        let kept = EXACT.read().unwrap().keys().filter(|(at, len)| *len == 48 && *at >= start && *at < start + VIEWS * 64).count();
+        assert_eq!(kept, VIEWS as usize, "one copy per view");
     }
 }
 
