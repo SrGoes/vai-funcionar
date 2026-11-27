@@ -3,16 +3,22 @@
 ## Em uma frase
 O port abre e chega ao mundo em placa NVIDIA no Windows 10, a 8-12 FPS e sem o roxo, mas está abaixo dos dois pisos de "jogável": falta FPS, a água tem retângulos, a vegetação pisca ao andar e a iluminação do jogo não roda.
 
-## Onde foi medido
-| | Máquina das medições de 26 e 27/11 |
-|---|---|
-| Placa | GeForce RTX 4080 16 GB, driver 621.24, Resizable BAR ligado (BAR1 de 16 GB) |
-| Processador | Ryzen 7 9800X3D |
-| RAM | 32 GB (31 GB visíveis) |
-| Sistema | Windows 10 Pro 19045 |
-| Rota e perfil | kit da rota nvidia com perfil de console **Series S** e o cache normal, por um launcher local. O `Play-VIctory.cmd` força **Series X** e usa outro cache: nada foi medido em Series X nesta máquina |
+## As duas máquinas
+O trabalho acontece em duas máquinas, as duas com GeForce. Todo número diz de qual delas veio.
 
-A máquina descrita no `CLAUDE.md` é outra (RTX 5060 8 GB, 16 GB de RAM). Número de uma não vale para a outra.
+| | Máquina A (medições de 26 e 27/11) | Máquina B (dono do repositório; a do `CLAUDE.md`) |
+|---|---|---|
+| Placa | RTX 4080 16 GB, driver 621.24, Resizable BAR ligado | RTX 5060 8 GB, driver 621.40 |
+| Processador | Ryzen 7 9800X3D | Core i5-13400F |
+| RAM | 32 GB | 16 GB |
+| Sistema | Windows 10 Pro 19045 (precisa de `cargo xtask agility`) | não registrado aqui |
+| Rota | nvidia | nvidia |
+| Perfil de console usado | Series S, por um launcher local com o kit da rota nvidia e o cache normal | Series S (#2) e Series X (#3) |
+
+- **Rota igual nas duas:** nvidia. Número medido pela rota amd não vale para nenhuma.
+- **O que as separa hoje é a RAM, não a placa.** O port usa 24-25 GB de RAM na máquina A com o kit da rota nvidia. Na máquina B, com 16 GB, a sessão em Series S cai depois de ~9 min (#2) e Series X não se sustenta (#3). Baixar a memória do port é o que destrava a máquina B.
+- **O `Play-VIctory.cmd` força Series X.** Nada foi medido em Series X na máquina A; o modo automático só escolhe Series X com 48 GB de RAM e 12 GB de VRAM.
+- As duas placas têm folga para o jogo: na máquina A a placa fica 43-54% ocupada e quem limita o FPS é o processador preparando cada quadro (ver abaixo).
 
 ## O que entrou na main em 27/11
 | Peça | Commits | Estado |
