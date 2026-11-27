@@ -1,11 +1,11 @@
-r"""One unattended measuring run: start the title through scripts/play.ps1, wait for the world, sample the
-window title for SAMPLE seconds, read the log of the sample window, close.
+r"""One unattended measuring run through scripts/play.ps1: wait for the world, sample the title, read the log, close.
+
 
     python scripts/measure/bench.py --name N --route nvidia [--build diag] [--console series-s] [--safe]
                                     [--vars "VICTORY_A=1;VICTORY_B=2"] [--victory PATH] [--settle 20] [--sample 75]
     python scripts/measure/bench.py --parse RUN_DIR START_UTC END_UTC     (read a finished run's log again)
 
-The title is VICTORY_GAME_DIR\<VICTORY_GAME_EXE, default game_scarlett_master.exe>, as Play-VIctory.cmd starts it.
+The title is VICTORY_GAME_DIR\game_scarlett_master.exe, as Play-VIctory.cmd starts it.
 A run is valid only if the title lived through the whole sample; a close by hand (close button, Alt+F4) or an early
 end is reported as the reason, never as a result. The window's close command is greyed during the run.
 Input: one Enter at 10 s (the account picker) and one at 14 s (falls on the intro); nothing in the world, where Enter
@@ -19,8 +19,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+# Overridable for another save: VICTORY_BENCH_KEYS (VICTORY_KEYS form) and VICTORY_BENCH_WORLD_ALSO (frames after the
+# world's first one that are captured, for ab.py).
 KEYS = os.environ.get("VICTORY_BENCH_KEYS", "10:Enter,14:Enter")
-WORLD_ALSO = os.environ.get("VICTORY_BENCH_WORLD_ALSO", "264,304,360,400")  # frames for ab.py
+WORLD_ALSO = os.environ.get("VICTORY_BENCH_WORLD_ALSO", "264,304,360,400")
+LAUNCHED = False  # a title this module started and has not closed yet
 ANSI = re.compile(r"\x1b\[[\d;]*m")
 STAMP = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d+)Z ")
 SHAPE = re.compile(r"([\d.]+) fps ([\d.]+) ms/frame (\d+) draws/frame")
@@ -49,6 +52,26 @@ def windows():
     return pids, found
 
 
+def close_ours():
+    """Closes the title this module started, if it is still open; never one it did not start."""
+    global LAUNCHED
+    if LAUNCHED:
+        subprocess.run("taskkill /IM victory.exe /F", shell=True, capture_output=True)
+        for _ in range(20):
+            if not windows()[0]: break
+            time.sleep(0.5)
+        LAUNCHED = False
+
+
+def dropped_by_reason(lines):
+    """Sum, over the given log lines, of the "dropped N/frame without a host pipeline: <reason>" lines by reason."""
+    reasons = {}
+    for l in lines:
+        m = re.search(r"dropped ([\d.]+)/frame without a host pipeline: (.+?)(?: [0-9a-f]{16}|\s*\[|,|$)", l)
+        if m: reasons[m[2]] = round(reasons.get(m[2], 0) + float(m[1]), 1)
+    return reasons
+
+
 def read(lock_close=True):
     pids, found = windows()
     if found and lock_close:
@@ -70,12 +93,17 @@ def p95(values):
 
 def launch(run, route, build, console, safe, vars_, victory=None):
     """Starts scripts/play.ps1 with its output in run/out.log and run/err.log."""
-    game = Path(os.environ["VICTORY_GAME_DIR"]) / os.environ.get("VICTORY_GAME_EXE", "game_scarlett_master.exe")
-    args = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ROOT / "scripts" / "play.ps1"),
-            "-Exe", str(game), "-Route", route, "-Build", build, "-Console", console, "-Vars", vars_]
-    if safe: args.append("-Safe")
-    if victory: args += ["-Victory", victory]
-    (run / "env.txt").write_text(" ".join(args[5:]))
+    global LAUNCHED
+    if not os.environ.get("VICTORY_GAME_DIR"):
+        raise SystemExit("Set VICTORY_GAME_DIR to the folder of your copy of the title.")
+    game = Path(os.environ["VICTORY_GAME_DIR"]) / "game_scarlett_master.exe"
+    script = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ROOT / "scripts" / "play.ps1")]
+    params = ["-Exe", str(game), "-Route", route, "-Build", build, "-Console", console, "-Vars", vars_]
+    if safe: params.append("-Safe")
+    if victory: params += ["-Victory", victory]
+    (run / "env.txt").write_text(" ".join(params))
+    args = script + params
+    LAUNCHED = True
     with open(run / "out.log", "wb") as o, open(run / "err.log", "wb") as e:
         subprocess.Popen(args, cwd=ROOT, stdout=o, stderr=e, stdin=subprocess.DEVNULL, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
 
@@ -111,23 +139,33 @@ def parse_log(run, start, end):
         r["shared_buffers_per_s"] = round(r["shared_buffers_made"] / span, 1) if span else None
     card = [int(n[0]) for _, l in stamped("the card's clock per frame") if (n := nums(l, r"the card about (\d+)% busy"))]
     if card: r["card_busy_pct_median"] = statistics.median(card)
-    split = [n for _, l in stamped(" fps, ") if (n := nums(l, r"\(([\d.]+) preparing.*?textures ([\d.]+) ms.*?; ([\d.]+) on the GPU; ([\d.]+) copying back"))]
+    split = [n for _, l in stamped(" fps, ") if (n := nums(l, r"\(([\d.]+) preparing.*?; ([\d.]+) on the GPU; ([\d.]+) copying back"))]
     if split:
-        for i, k in enumerate(("split_preparing_ms", "split_textures_ms", "split_gpu_ms", "split_copyback_ms")):
+        for i, k in enumerate(("split_preparing_ms", "split_gpu_ms", "split_copyback_ms")):
             r[k] = statistics.median(float(s[i]) for s in split)
+    tex = [float(n[0]) for _, l in stamped(" fps, ") if (n := nums(l, r"textures ([\d.]+) ms"))]
+    if tex: r["split_textures_ms"] = statistics.median(tex)
     frames = [n for _, l in stamped(" fps, ") if (n := nums(l, r"([\d.]+) fps, ([\d.]+) ms/frame"))]
     if frames:
         r["log_fps_median"] = statistics.median(float(n[0]) for n in frames)
         r["log_ms_median"] = statistics.median(float(n[1]) for n in frames)
     dropped = [int(n[0]) for _, l in stamped(" fps, ") if (n := nums(l, r"dropped (\d+) without a host pipeline"))]
     if dropped: r["dropped_no_pipeline_median"] = statistics.median(dropped)
-    reasons = {}
-    for _, l in stamped("/frame without a host pipeline: "):
-        m = re.search(r"dropped ([\d.]+)/frame without a host pipeline: (.+?)(?: [0-9a-f]{16}|\s*\[|,|$)", l)
-        if m: reasons[m[2]] = round(reasons.get(m[2], 0) + float(m[1]), 1)
-    r["dropped_by_reason_sum_of_lines"] = reasons
+    r["dropped_by_reason_sum_of_lines"] = dropped_by_reason(l for _, l in stamped("/frame without a host pipeline: "))
     views = stamped("buffer views off their copy's elements")
-    if views: r["views_line"] = views[-1][1].split(": ", 1)[-1]
+    if views:
+        r["views_line"] = views[-1][1].split(": ", 1)[-1]
+        asked = [float(n[0]) for _, l in views if (n := nums(l, r"([\d.]+) asked for per frame"))]
+        copies = [float(n[0]) for _, l in views if (n := nums(l, r"([\d.]+) copies of their own bytes made per frame"))]
+        if asked: r["views_asked_per_frame"] = statistics.median(asked)
+        if copies: r["views_copies_in_new_buffers_per_frame"] = statistics.median(copies)
+    lim = [n for _, l in stamped("card buffer limits", inside=False) if (n := nums(l, r"card_buffers_min_kb=(\d+)"))]
+    if lim: r["card_buffers_min_kb"] = int(lim[-1][0])
+    ds = [n for _, l in stamped("dynamic slots:") if (n := nums(l, r"dynamic slots: ([\d.]+) tables asked, ([\d.]+) refused"))]
+    if ds:
+        r["dynamic_tables_asked_median"] = statistics.median(float(n[0]) for n in ds)
+        r["dynamic_tables_refused_max"] = max(float(n[1]) for n in ds)
+    r["pipelines_still_compiling_in_sample"] = len(stamped("requested pipeline still compiling"))
     vram = [n for _, l in stamped("video memory as the system counts it") if (n := nums(l, r"the card's own: budget \d+ MB, in use (\d+) MB.*?shared with the card: budget \d+ MB, in use (\d+) MB"))]
     if vram:
         r["vram_dedicated_in_use_mb_peak"] = max(int(v[0]) for v in vram)
@@ -140,6 +178,7 @@ def parse_log(run, start, end):
     hm = [n for _, l in stamped("shaders from the cache and translated so far", inside=False) if (n := nums(l, r"hits=(\d+).*?misses=(\d+)"))]
     if hm: r["shader_cache_hits"], r["shader_cache_misses"] = int(hm[-1][0]), int(hm[-1][1])
     r["async_submit_on"] = any("submissions are prepared and sent by a thread of ours" in l for l in log)
+    r["async_submit_refused"] = any("VICTORY_ASYNC_SUBMIT=1 needs the relay" in l for l in log)
     r["device_removed"] = any("device removed" in l.lower() or "DXGI_ERROR_DEVICE" in l for l in log)
     r["panics"] = sum("panicked at" in l for l in log)
     r["window_closed"] = any("window closed: suspending the title" in l for l in log)
@@ -158,11 +197,7 @@ def one(name, route, build="diag", console="series-s", safe=False, extra="", vic
     def done(why=""):
         result["why"], result["valid"] = why, not why
         (run / "result.json").write_text(json.dumps(result, indent=1))
-        if not keep:
-            subprocess.run("taskkill /IM victory.exe /F", shell=True, capture_output=True)
-            for _ in range(20):
-                if not windows()[0]: break
-                time.sleep(0.5)
+        if not keep: close_ours()
         return result
     if windows()[0]: return {**result, "why": "victory.exe already running"}
     if busy(): return {**result, "why": f"a build is running: {busy()}"}
@@ -171,7 +206,7 @@ def one(name, route, build="diag", console="series-s", safe=False, extra="", vic
     started, world_at, last = time.time(), None, None
     while time.time() - started < world_timeout:
         time.sleep(3)
-        pids, now = read()
+        pids, now = read(not keep)
         if not pids and time.time() - started > 15: return done("the title ended before the world")
         if now:
             last = now
@@ -182,7 +217,7 @@ def one(name, route, build="diag", console="series-s", safe=False, extra="", vic
     rows, ended = [], False
     t0 = datetime.now(timezone.utc); begin = time.time()
     while time.time() - begin < sample:
-        pids, now = read()
+        pids, now = read(not keep)
         if not pids: ended = True; break
         if now: rows.append(now)
         time.sleep(2)
@@ -192,6 +227,7 @@ def one(name, route, build="diag", console="series-s", safe=False, extra="", vic
     if rows:
         ms = [r[1] for r in rows]
         result |= {"fps_median": statistics.median(r[0] for r in rows), "fps_from_ms_median": round(1000 / statistics.median(ms), 2),
+                   "fps_min": min(r[0] for r in rows), "fps_max": max(r[0] for r in rows),
                    "ms_median": statistics.median(ms), "ms_p95_of_title_samples": p95(ms),
                    "draws_median": statistics.median(r[2] for r in rows)}
     time.sleep(1)
@@ -208,12 +244,18 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--parse":
         iso = lambda s: datetime.fromisoformat(s.replace("Z", "+00:00"))
         print(json.dumps(parse_log(Path(sys.argv[2]), iso(sys.argv[3]), iso(sys.argv[4])), indent=1)); sys.exit(0)
-    a = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    a.add_argument("--name", required=True); a.add_argument("--route", required=True, choices=["nvidia", "amd"])
-    a.add_argument("--build", default="diag", choices=["diag", "release"]); a.add_argument("--console", default="series-s")
-    a.add_argument("--safe", action="store_true"); a.add_argument("--vars", default=""); a.add_argument("--victory")
-    a.add_argument("--settle", type=int, default=20); a.add_argument("--sample", type=int, default=75)
-    a.add_argument("--out"); a.add_argument("--keep", action="store_true")
+    a = argparse.ArgumentParser(description=__doc__.split("\n\n")[0], formatter_class=argparse.RawDescriptionHelpFormatter)
+    a.add_argument("--name", required=True, help="a name for the run's folder")
+    a.add_argument("--route", required=True, choices=["nvidia", "amd"], help="the kit of settings of your card (scripts/play.ps1 -Route)")
+    a.add_argument("--build", default="diag", choices=["diag", "release"], help="target\\<build>\\victory.exe (diag gives the log figures)")
+    a.add_argument("--console", default="series-s", help="the console the title sees")
+    a.add_argument("--safe", action="store_true", help="scripts/play.ps1 -Safe")
+    a.add_argument("--vars", default="", help='more settings, "VICTORY_A=1;VICTORY_B=2"')
+    a.add_argument("--victory", help="another victory.exe")
+    a.add_argument("--settle", type=int, default=20, help="seconds in the world before sampling (default 20)")
+    a.add_argument("--sample", type=int, default=75, help="seconds sampled (default 75)")
+    a.add_argument("--out", help="folder for the run's folder (default %%TEMP%%)")
+    a.add_argument("--keep", action="store_true", help="leave the title open at the end")
     o = a.parse_args()
     r = one(o.name, o.route, o.build, o.console, o.safe, o.vars, o.victory, settle=o.settle, sample=o.sample, out=o.out, keep=o.keep)
     print(json.dumps(r, indent=1)); sys.exit(0 if r["valid"] else 2)

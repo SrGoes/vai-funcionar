@@ -11,7 +11,7 @@ compare:  vis360.py compare RUN_BASE RUN_CAND OUT [--giro A-B] [--mask x0,y0,x1,
           com o pisca de cada rajada (quadros de números seguidos), a diferença por ângulo e os draws descartados
           por motivo de cada rodada. Nada sai da máquina.
 """
-import json, os, re, subprocess, sys, time
+import json, os, re, sys, tempfile, time
 from datetime import datetime
 from pathlib import Path
 import numpy as np
@@ -22,8 +22,6 @@ import bench
 ANSI = re.compile(r"\x1b\[[\d;]*m")
 STAMP = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d+)Z ")
 
-def log_lines(run):
-    return bench.log_lines(run)
 
 def world_time(lines):
     for l in lines:
@@ -33,7 +31,7 @@ def world_time(lines):
 
 def captures(run):
     """[(seconds after world, frame number, path)] in order."""
-    lines = log_lines(run); t0, f0 = world_time(lines)
+    lines = bench.log_lines(run); t0, f0 = world_time(lines)
     out = []
     for l in lines:
         m = re.search(r"frame saved path=(\S*?frame-(\d+)\.png)", l)
@@ -44,11 +42,7 @@ def captures(run):
     return out
 
 def dropped(run):
-    lines = log_lines(run); reasons = {}
-    for l in lines:
-        m = re.search(r"dropped ([\d.]+)/frame without a host pipeline: (.+?)(?: [0-9a-f]{16}|\s*\[|,|$)", l)
-        if m: reasons[m[2]] = round(reasons.get(m[2], 0) + float(m[1]), 1)
-    return reasons
+    return bench.dropped_by_reason(bench.log_lines(run))
 
 def bursts(caps, least=6):
     """Runs of consecutive frame numbers (a burst taken without touching the camera)."""
@@ -62,7 +56,9 @@ def bursts(caps, least=6):
     return runs
 
 def flicker(burst, B=16, T=24.0, R=0.35):
-    """Blocks that change from both neighbours while the neighbours agree: a thing shown in one frame only."""
+    """Blocks that change from both neighbours while the neighbours agree: a thing shown in one frame only.
+    B: block side in pixels of the half-size capture; T: least mean change (of 255) from each neighbour;
+    R: the neighbours must differ from each other by less than R times that change."""
     bl = []
     for _, _, p in burst:
         a = np.asarray(Image.open(p).convert("RGB"), np.float32); h, w, _ = a.shape
@@ -75,7 +71,7 @@ def flicker(burst, B=16, T=24.0, R=0.35):
     return {"frames": len(burst), "frames_with_flicker": frames, "flicker_blocks": n, "worst": sorted(worst, reverse=True)[:3]}
 
 def run_cmd(name, route, build, extra, end_s=60):
-    out = Path(os.environ.get("TEMP", ".")) / f"victory-vis360-{time.strftime('%Y%m%d-%H%M%S')}-{name}"
+    out = Path(tempfile.gettempdir()) / f"victory-vis360-{time.strftime('%Y%m%d-%H%M%S')}-{name}"
     (out / "cap").mkdir(parents=True)
     keys = "10:Enter"
     m = re.search(r"VICTORY_KEYS=([^;]*)", extra)
@@ -83,16 +79,16 @@ def run_cmd(name, route, build, extra, end_s=60):
         keys += "," + m[1]
         extra = ";".join(p for p in extra.split(";") if p and not p.startswith("VICTORY_KEYS="))
     vars_ = ";".join(v for v in ("VICTORY_LOG=info", extra, f"VICTORY_KEYS={keys}", f"VICTORY_CAPTURE={out / 'cap'}", "VICTORY_CAPTURE_WORLD=1") if v)
-    assert not bench.windows()[0], "victory.exe already running"
-    assert not bench.busy(), "a build is running"
+    if bench.windows()[0]: raise SystemExit("victory.exe already running")
+    if bench.busy(): raise SystemExit(f"a build is running: {bench.busy()}")
     bench.launch(out, route, build, "series-s", False, vars_, os.environ.get("VIS_VICTORY"))
     start, why, t_world = time.time(), "timeout", None
     while time.time() - start < 420 + end_s:
         time.sleep(2); pids, _ = bench.read(True)
         if not pids and time.time() - start > 15: why = "ended"; break
-        if t_world is None and world_time(log_lines(out))[0]: t_world = time.time()
+        if t_world is None and world_time(bench.log_lines(out))[0]: t_world = time.time()
         if t_world and time.time() - t_world >= end_s: why = "done"; break
-    subprocess.run("taskkill /IM victory.exe /F", shell=True, capture_output=True)
+    bench.close_ours()
     r = {"name": name, "run": str(out), "why": why, "captures": len(captures(out)), "vars": vars_}
     (out / "vis360.json").write_text(json.dumps(r, indent=1)); print(json.dumps(r))
 
