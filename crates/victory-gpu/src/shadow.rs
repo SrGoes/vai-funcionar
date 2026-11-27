@@ -5681,13 +5681,13 @@ impl<T> Spares<T> {
         self.by_width.entry(width).or_default().push((item, after));
     }
 
-    /// One of `width` bytes whose submission is among the `finished`.
     /// Everything kept, emptied.
     fn drain(&mut self) -> Vec<(T, u64)> {
         self.bytes = 0;
         std::mem::take(&mut self.by_width).into_values().flatten().collect()
     }
 
+    /// One of `width` bytes whose submission is among the `finished`.
     fn take(&mut self, width: u64, finished: u64) -> Option<T> {
         let items = self.by_width.get_mut(&width)?;
         let at = items.iter().position(|(_, after)| *after <= finished)?;
@@ -5865,9 +5865,12 @@ mod exact_tests {
     /// was before. Their buffers are those the copies of two frames before
     /// let go, and read zeros until refreshed. (On main b2184b1 every copy
     /// made a buffer: 2,400 here.) Needs a host GPU: without one it says it
-    /// was skipped and passes, which covers nothing. Counts globally: run
-    /// with `--test-threads=1`.
+    /// was skipped and passes, which covers nothing. It reads counters every
+    /// copy of the process adds to, so another test that makes copies at the
+    /// same time throws its count off (#26): left out of the suite, run alone
+    /// with `--ignored --test-threads=1`.
     #[test]
+    #[ignore = "host GPU and global counters: run alone, --ignored --test-threads=1 (#26)"]
     fn gpu_copies_of_views_at_new_places_take_the_buffers_let_go() {
         if host().is_none() {
             eprintln!("skipped: no host GPU here");
