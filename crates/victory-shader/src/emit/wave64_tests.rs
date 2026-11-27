@@ -1263,6 +1263,50 @@ fn a_wave_wide_scc_branch_no_form_can_take_falls_back_to_the_per_lane_split() {
     }
 }
 
+/// [`mask_scc_behind_a_kept_skip`] in a group of two console waves that writes and reads LDS
+/// inside the skipped code. Before #66 its branch on the mask's SCC went by each lane's bit, so
+/// no console lane was involved and it translated. Taken as the wave's, the branch makes the
+/// mask data and LDS in that region keeps 64-lane waves: refused for another reason than
+/// [`lower::WAVE_WIDE_ELSEWHERE`] ("no wave32 lowering"), which the per-lane split must cover too.
+#[test]
+fn a_program_refused_for_any_reason_by_the_wave_wide_scc_form_is_split_per_lane() {
+    let mut body = vec![0x7E02_0280]; // v_mov_b32 v1, 0: the LDS address
+    let kept = mask_scc_behind_a_kept_skip();
+    let words: Vec<u32> = kept.code.chunks(4).map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect();
+    // (past the fixture's descriptor load, up to its EXEC skip and the code it skips)
+    let (head, rest) = words[3..words.len() - 1].split_at(5);
+    body.extend_from_slice(&head[..4]);
+    body.push(0xBF88_000E); // s_cbranch_execz to the restore, past the LDS pair too
+    body.extend_from_slice(&[
+        0x36 << 26 | 0x0D << 18, // ds_write_b32 v1, v1
+        1 << 8 | 1,
+        0x36 << 26 | 0x36 << 18, // ds_read_b32 v2, v1
+        2 << 24 | 1,
+    ]);
+    body.extend_from_slice(rest);
+    let mut native = native_of(&body, true, 128);
+    native.io = StageIo::Cs(ComputeIo { rsrc2: 1 << 15 | 5 << 1, threads: [128, 1, 1] });
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("IR");
+    assert!(p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name() == "ds_read_b32"));
+    let st = structure::structure(&p).expect("structure");
+    assert_eq!(st.wave_scc.len(), 1, "the branch on the mask's SCC is the wave's");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resources");
+    let io = io::raise(&p, &native).expect("io");
+    let c = crate::Container { digest: [0; 16], version: (1, 0), parts: Vec::new() };
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let exact = super::emit_forms(&c, &native, &p, &st, &io, &res);
+    let shader = super::emit(&c, &native, &p, &st, &io, &res);
+    lower::TEST_HOST_WAVE.set(was);
+    match &exact {
+        Err(ShaderError::Unsupported { what, .. }) => assert_ne!(*what, lower::WAVE_WIDE_ELSEWHERE),
+        other => panic!("the wave-wide form should refuse: {:?}", other.as_ref().err()),
+    }
+    let shader = shader.expect("split per lane, the program translates as before #66");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone()).expect("DXIL validation");
+    }
+}
+
 fn emit_nested_mask_scc(native: &NativeProgram, p: &ir::Program) -> HostShader {
     let st = structure::structure(p).expect("structure");
     let res = resource::track(p, &native.layout, native.stage, Some(&st)).expect("resources");
