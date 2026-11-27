@@ -1,6 +1,6 @@
 # Lacunas abertas (27/11/2026)
 
-Régua: **bloqueia** = abaixo do piso de "jogável"; **degrada** = incomoda sem impedir; ver `GLOSSARY.md`. "Issue" vazia = ainda sem issue.
+Os defeitos vistos jogando estão numerados em `relatos.md`; aqui ficam as causas e os testes. Régua: **bloqueia** = abaixo do piso de "jogável"; **degrada** = incomoda sem impedir; ver `GLOSSARY.md`. "Issue" vazia = ainda sem issue.
 
 ## Imagem
 | Lacuna | Régua | O que se sabe | Teste que decide | Conserto provável | Issue |
