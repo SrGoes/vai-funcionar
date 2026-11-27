@@ -562,7 +562,28 @@ pub(crate) unsafe fn piece(
     copy: *const crate::shadow::Shadow,
 ) -> u64 {
     // SAFETY: the caller's.
-    unsafe { piece_at(title, now, held, parts, take, notes, beside_on(), copy) }
+    unsafe {
+        piece_at(
+            Landing {
+                title,
+                now,
+                held,
+                parts,
+            },
+            take,
+            notes,
+            beside_on(),
+            copy,
+        )
+    }
+}
+
+/// Where a piece goes and where it comes from, as [`piece`] takes them.
+struct Landing<'a> {
+    title: usize,
+    now: *const u8,
+    held: *mut u8,
+    parts: &'a [(usize, usize)],
 }
 
 /// [`piece`], and whether a view of ours is looked for.
@@ -570,15 +591,18 @@ pub(crate) unsafe fn piece(
 /// # Safety
 /// [`piece`]'s.
 unsafe fn piece_at(
-    title: usize,
-    now: *const u8,
-    held: *mut u8,
-    parts: &[(usize, usize)],
+    landing: Landing,
     take: bool,
     notes: &mut Notes,
     beside: bool,
     copy: *const crate::shadow::Shadow,
 ) -> u64 {
+    let Landing {
+        title,
+        now,
+        held,
+        parts,
+    } = landing;
     let Some(end) = parts.last().map(|p| p.1) else {
         return 0;
     };

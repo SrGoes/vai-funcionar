@@ -152,7 +152,7 @@ enum Command {
     /// Run a captured frame's GPU work again (diagnostics builds; see
     /// docs/replay.md).
     #[cfg(all(windows, feature = "diagnostics"))]
-    Replay(replay::Replay),
+    Replay(Box<replay::Replay>),
     /// Show the resolved configuration and check it.
     Config,
 }
@@ -231,7 +231,7 @@ fn main() -> Result<()> {
             run::run(&exe, unimplemented, strict, execute, console)
         }
         #[cfg(all(windows, feature = "diagnostics"))]
-        Command::Replay(options) => replay::run(options),
+        Command::Replay(options) => replay::run(*options),
         Command::Config => show_config(),
     }
 }
