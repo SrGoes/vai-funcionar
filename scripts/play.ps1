@@ -86,6 +86,9 @@ if ($Route -eq 'amd') {
         VICTORY_EXACT_LAZY = '1'; VICTORY_COPY_BY_RANGE = '1'; VICTORY_FLUSH_GROUPED = '1'
         VICTORY_CARD_STEPS_JOIN = '1'
         VICTORY_PORT_GUARD = '1'; VICTORY_PORT_GUARD_PLAN = '1'; VICTORY_ASK_NORESET = '1'
+        # DRAW_QUICK: slots that already hold the resource skip the AddRef/Release (A/B:
+        # median -1 to -4 ms, mean -5 to -10 ms in the heavy phases).
+        VICTORY_DRAW_QUICK = '1'
     }
     if ($LowMemory) {
         # Play-VIctory-4GB.cmd: the estimate (not the constant), the guard at its
