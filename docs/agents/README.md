@@ -28,3 +28,19 @@ Esta pasta mantém alinhadas as sessões de agente (Claude ou outro) que trabalh
 - Separe sempre "medido aqui", "afirmado por outro fork" e "hipótese". Diga em que máquina, perfil de console e rota o número foi medido.
 - Nada de caminho local, log bruto, imagem ou arquivo do jogo nesta pasta (ver `docs/asset-policy.md`).
 - Nos achados, "main", "worker" e "pi" são os nomes das três sessões que trabalharam em 26 e 27/11/2026: coordenação, código e medição.
+
+## Termos dos achados que não estão no `GLOSSARY.md`
+| Termo | O que é |
+|---|---|
+| Forma wide | Jeito aproximado de traduzir um programa de grupos de 64 para placa de grupos de 32. É forçada para alguns programas; `VICTORY_WAVE_WIDE=0` desliga |
+| Forma paired | Jeito do fork fxceless de traduzir os mesmos programas com as duas metades do grupo emparelhadas. Não existe nesta árvore |
+| Half-meets | Pontos em que as duas metades de 32 de um grupo de 64 se encontram para trocar dados (`order_waves`, `half_meet_at`) |
+| Defrag | O programa `CS_DefragHeap_ComputeRelocations` (`02384a60fda6f2d0`) |
+| Construtor de BVH | Os 52 programas do jogo que montam a estrutura do ray tracing dele |
+| Views e tabelas de descritores | As referências a texturas e buffers que cada draw usa. A NVIDIA limita o heap a 1.000.000 de views |
+| Ponto fixo | O lugar do save onde o jogo carrega e ninguém toca, usado para comparar rodadas |
+| Kit antigo | O kit da rota amd (`scripts\play.ps1` com `-Safe`), usado por engano até 27/11 às 02:10 |
+| Build antigo | O build `81ffe9e`, anterior ao PR #28 |
+| T1, T2, T3, B1, OLD | Rodadas únicas de 27/11: kit nvidia; com envio assíncrono; com `VICTORY_THIN=1`; kit antigo parado; build antigo por 61 min |
+| Matriz N | A matriz de medição que usa o kit da rota nvidia como base |
+

@@ -4,13 +4,13 @@
 - Programa: compute `02384a60fda6f2d0` = `DEFRAG_HASH`, `CS_DefragHeap_ComputeRelocations` (`crates/victory-gpu/src/draw.rs:19`). No build antigo era recusado sem barulho.
 - Commits cool_fox c36f9f4 e ca7e21a (entraram com o #28) fazem `exchange_halves` chamar `order_waves(at, …)` -> `half_meet_at(block)`, que reescreve o terminador e move `self.cur`: só vale se `block == self.cur`. O chamador `mask_dword` (`lower.rs` ~3997-4024) passa `tail[def_block]`, bloco já fechado. Confirmado por execução com assert temporário ("half-meet at a block that is not the current one"). `scc_some` (~4924/4938) tem a mesma forma, não exercitado.
 - O pânico aparece em `emit/bitcode.rs:872` ("use of a void value"); no jogo é capturado em `pipeline/make.rs:173`; no `victory shaders` derrubava o comando (saída 101).
-- **Conserto mínimo: 36b998b** em `fix/30-half-meet-block`: `order_waves` recusa com `HALF_MEET_CLOSED` ("a half-meet in a block already closed"). Teste `half_meet_in_a_closed_block_is_refused` (vermelho na base, verde depois). Suíte victory-shader: 266 ok / 34 falhos, as mesmas 34 da base por nome (SM 6.6 sem Agility). `victory shaders` sem `VICTORY_DEFRAG`: saída 0, 25.657 no cache, 232 sem tradução (195 contêineres sem programa, 37 "no wave32 lowering"). Está no build play-melhor. **Sem PR ainda.**
+- **Conserto mínimo: 36b998b** em `fix/30-half-meet-block`: `order_waves` recusa com `HALF_MEET_CLOSED` ("a half-meet in a block already closed"). Teste `half_meet_in_a_closed_block_is_refused` (vermelho na base, verde depois). Suíte victory-shader: 266 ok / 34 falhos, as mesmas 34 da base por nome (SM 6.6 sem Agility). `victory shaders` sem `VICTORY_DEFRAG`: saída 0, 25.657 no cache, 232 sem tradução (195 contêineres sem programa, 37 "no wave32 lowering"). Está no build build integrado. **Sem PR ainda.**
 - Paliativo por chave enquanto não entra: `VICTORY_DEFRAG=0` (`emit/mod.rs:650`).
 
-## Tradução de verdade (worker, `.worktrees/fix-30-exchange`, branch `fix/30-exchange-in-current-block`, sobre 36b998b; escrita, NÃO compilada)
+## Tradução de verdade (branch `fix/30-exchange-in-current-block`, sobre 36b998b)
 - `Lower::exchange_block(at, made)`: com half-meets e `at != self.cur`, a troca inteira (store, encontro, loads, encontro) vai para o bloco aberto; o ballot fica no bloco que escreveu a máscara. Par trocado guardado em `met_ballots[(lo, cur_ir)]`. Incorpora a ideia do cool_fox PR #53: troca com barreira de grupo na definição quando o grupo inteiro passa por ela.
 - Testes: `a_mask_written_before_is_exchanged_where_it_is_read` e, na placa (precisa de SM 6.6/Agility), `a_mask_read_after_its_block_is_the_consoles_on_two_waves_that_meet_on_their_own` (grupo de 128, s0 = 0, 20, 40, 64, 100, 128, comparação bit a bit com a máscara calculada no processador), mais um com máscara escrita num ramo externo e lida num interno.
-- Não verificado: se `all_lanes(cur_ir)` vale na região wide do defrag; número de sites de encontro (`meet_cap`). Desenho completo em (arquivo local, fora do repositório)).
+- Não verificado: se `all_lanes(cur_ir)` vale na região wide do defrag; número de sites de encontro (`meet_cap`).
 
 ## Os 37 (issue #11)
 - "no wave32 lowering" nasce em `emit/mod.rs:771`; motivos em `lower.rs:1874-1909`; tentativas R1-R6 em `mod.rs:532-750`.
@@ -24,5 +24,5 @@
 - **NÃO provado na placa:** os dois testes com Agility (`test/30-exchange-agility`) dão "device removed". Causa provável, não confirmada: o shader com half-meets usa o root UAV `u252` (`SLOT_MEET`) e o harness `whole_uav` só liga um UAV; o cool_fox PR #53 acrescenta `Root::Uav` ao harness para isso.
 - **NÃO levar `fdd93ea` ao build de jogo** enquanto não passar na placa: o fxceless relatou grade colorida nos rostos com o defrag rodando.
 - `TRANSLATOR_VERSION` ainda não subiu (sobe quando a branch for para o jogo).
-- Target compartilhado (`.worktrees\_target-shared`): 1º build de diagnóstico completo, frio: 349 s com `-j 6` em prioridade Idle e o jogo aberto.
+- Target de build compartilhado entre worktrees: 1º build de diagnóstico completo, frio: 349 s com `-j 6` em prioridade Idle e o jogo aberto.
 - **RAM:** durante o link desse build a RAM livre caiu a 480 MB com o jogo aberto. Regra nova: nada de link pesado com o jogo aberto.

@@ -7,7 +7,7 @@ Licença: cool_fox, fxceless, avatarmanz, DexNom, flamingo, Dathinel, Belobug, M
 
 ## 1. Retângulos na água
 - cool_fox issue #50 (RTX 5080): aparecem quando `5dc3b25986622949` e `6f225b641c5b0708` (`CS_TransmissionVolumetrics_Tiled` e `_LocalLights`) passam a rodar; sem eles a água fica limpa.
-- Na nossa árvore eles estão na lista `scene_kernel` (`crates/victory-shader/src/emit/mod.rs:625-640`; outra lista em `:509`), que força a forma "wave-wide" aproximada (commit 3c1f8bd). Na mesma lista: `CS_Tree_BatchCull`, `_ImposterOnly`, `CS_Visibility`.
+- Na nossa árvore eles estão na lista de programas que liga `scene_kernel` (`crates/victory-shader/src/emit/mod.rs:625-640`; outra lista em `:509`), que força a forma "wave-wide" aproximada (commit 3c1f8bd). Na mesma lista: `CS_Tree_BatchCull`, `_ImposterOnly`, `CS_Visibility`.
 - fxceless README (RTX 4070, 27/11): sem manchas quando esses dois não são forçados para a forma wide; com paired + reduções FP32 exatas a água ganha o verde (PR #1419, commits e3307c77, 3ab5c12b). fxceless issue #1401 (RTX 3060 Ti): paired em todos os compute de grupos de 64 tira os tiles pretos, mesmo FPS.
 - fxceless PR #834 (+368): dispatch indireto pedindo 85-115 mil grupos com corte em 65.535 deixa tiles velhos. **Descartado para a nossa cena:** maior pedido nosso 1.368.
 - Teste por chave: `VICTORY_WAVE_WIDE=0` (tira os seis programas da forma wide; esfria o cache; confunde com as árvores).
@@ -18,13 +18,13 @@ Licença: cool_fox, fxceless, avatarmanz, DexNom, flamingo, Dathinel, Belobug, M
 - Culls de árvore na forma wide (avatarmanz #424, RTX 2070 SUPER: com paired as árvores aparecem; cool_fox #51: `89d08e56` entra em pânico na forma wide). É a suspeita que sobra.
 
 ## 3. Os 37 programas em grupos de 64 e o #30
-- **cool_fox PR #53** (steven-seagull27, +188/-12): mesmo conserto mínimo do #30, verificado em RTX 5080 e WARP (640/640). Decide pelo bloco onde a troca é emitida e recusa bloco com terminador. **Não portar o PR #56** (esconde o defeito em `bitcode.rs:872`).
+- **cool_fox PR #53** (+188/-12): mesmo conserto mínimo do #30, verificado em RTX 5080 e WARP (640/640). Decide pelo bloco onde a troca é emitida e recusa bloco com terminador. **Não portar o PR #56** (esconde o defeito em `bitcode.rs:872`).
 - **fxceless #854** (+5.123; só a parte paired) + **#1419** (+1.084): falhas de compute 39 -> 5 numa RTX 5090; todos os 8 recusados rodam numa 2070 SUPER; 7 -> 0 numa 4080 SUPER. O defrag `02384a60` na forma paired dá grade colorida nos rostos: manter fora.
 - Alternativas: Belobug #128 (+1.790, só testes), #366 (+573), #345 (+127); avatarmanz #204 (+115); Marvisak #189 (+5.067, outro desenho: pular).
 
 ## 4. Tatuagem, braço cinza, decals pretas
 - fxceless #1401: `VICTORY_PACKED_LEVELS=1` (~110 linhas em `draw.rs`/`texture.rs`) para ruído por níveis grandes lendo o vizinho. fxceless #821: texturas enviadas antes da leitura terminar. fxceless #1264 (+488) e #1422 (+42): "bake sources sampled wrong" 30 -> 0; port do Dathinel `5d5dfcb` ("necessário, não suficiente").
-- Lista de pulados por padrão na nossa árvore (`pipeline.rs:124-142`, de f4164f8): `CS_ProjDecalCut`, `CS_CullMaskPass`, `CS_LodBlend`, `CS_CalculateFireVolumes`, `PS_Smh`. `VICTORY_HAIR=1` religa todos.
+- Lista de pulados por padrão na nossa árvore (`pipeline.rs:124-145`, de f4164f8): `CS_ProjDecalCut`, `CS_CullMaskPass`, `CS_LodBlend`, `CS_CalculateFireVolumes`, `PS_Smh`. `VICTORY_HAIR=1` religa todos.
 - **Ninguém tem conserto limpo** para tatuagem nem braço cinza.
 
 ## 5. Triângulos esticados: ninguém tem. Pistas: Marvisak #1319 (cargas escalares por handle errado), #1567 (`CS_PedStandardSkinning_7` lendo zeros), `CS_LodBlend` pulado.

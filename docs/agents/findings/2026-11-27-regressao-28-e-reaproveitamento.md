@@ -4,7 +4,7 @@
 - Commit **8977bb0** (+**1f6d319**), cherry-picks do Belobug (b68e65e, ce42cc7): "Keep structured buffer slots raw on hosts without descriptor twins".
 - `crates/victory-gpu/src/descriptor/host.rs:1339-1340` (`off_elements`): `needs_raw = stride > 0 && stride % 4 == 0 && !has_raw_twins` manda TODA view estruturada com início fora de 16 bytes para `shadow::exact()`.
 - `has_raw_twins` vem de `raw_views() != 0` (`host.rs:1383`), ligado só em `probe_view_limit` (`host.rs:1565-1568`) se o host aceitar heap de 2*2^21 views; a NVIDIA para em 1.000.000 (`PORTABLE_VIEWS`, `host.rs:1511`).
-- `crates/victory-gpu/src/shadow.rs:5659` `exact(address, len)`: cache `EXACT` indexado por (endereço do jogo, bytes). O jogo põe essas views em posições de anel que mudam todo quadro, então todo pedido falha no cache e chama `host().shared_buffer()` (`shadow.rs:5686` -> `host.rs:10759`): CreateCommittedResource + resident + Map. ~600 por quadro, 251 mil shared buffers em 4 min (13 mil no build antigo).
+- `crates/victory-gpu/src/shadow.rs`, `exact(address, len)` (os números de linha deste arquivo são os da árvore antes do conserto): cache `EXACT` indexado por (endereço do jogo, bytes). O jogo põe essas views em posições de anel que mudam todo quadro, então todo pedido falha no cache e chama `host().shared_buffer()` (`shadow.rs:5686` -> `host.rs:10759`): CreateCommittedResource + resident + Map. ~600 por quadro, 251 mil shared buffers em 4 min (13 mil no build antigo).
 - A correção do Belobug é legítima: sem gêmeo, leitura crua por view estruturada dá zeros na NVIDIA (`raw_window`, `host.rs:3988`).
 
 ## Conserto: reaproveitamento
@@ -19,7 +19,7 @@
 | B: reaproveitamento | 12,49 | 80,1 | 41 | 91% |
 | B0: reaproveitamento com `REUSE=0` | 3,42 | 292,6 | 1.776 | 24% |
 | C: cópias desligadas (alternativa 64d8d3a) | 12,68 | 78,9 | 44,5 | 93% |
-Referência anterior: build antigo 81ffe9e 12,0 FPS (83 ms), placa 71%. Arquivos: (arquivo local, fora do repositório)).
+Referência anterior: build antigo 81ffe9e 12,0 FPS (83 ms), placa 71%.
 
 ## Comparação da árvore (3 configurações, 96 quadros seguidos cada, varanda, câmera parada)
 Blocos piscando na faixa da água: padrão 114, `REUSE=0` 152, `VIEW_BYTES=0` 185. Pisca fora da água: 0 nas três. Conclusão: o reaproveitamento não cria pisca; os retângulos da água piscam mesmo com as cópias desligadas.

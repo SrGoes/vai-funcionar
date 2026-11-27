@@ -40,6 +40,6 @@ PR #53: mesmo conserto mínimo do #30, com `Root::Uav` no harness de teste (nece
 
 ## Outros
 - `Grimkaaah/Victory-Grimkaaah`: cópia do avatarmanz com ajustes, só AMD. Ideias: `VICTORY_TEXBACK_FREE`, `VICTORY_FILL_FORWARD`, `VICTORY_UP_QUEUE`.
-- `stellarr-studio/kelvaroq`: não está à frente (7 a 10 FPS em placas maiores). Ideias: lançamento de malha por estágio de amplificação; contador por tipo de limite indireto. Parte dos patches deriva de XCL: só ideia. Traz um `launch.dxil` pronto: nunca usar.
+- `stellarr-studio/kelvaroq`: não está à frente (7 a 10 FPS em placas maiores). Ideias: lançamento de malha por estágio de amplificação; contador por tipo de limite indireto. Parte dos patches vem de código GPL-2.0-only: só ideia. Traz um `launch.dxil` pronto: nunca usar.
 - `Marvisak/VIctory`: parado desde 25/11; PR #189 (grupos de 64, outro desenho).
 - Ninguém, em nenhum fork lido, tem ray tracing com imagem iluminada em NVIDIA, nem conserto limpo para tatuagem, braço cinza e rosto sem superfície.

@@ -3,16 +3,16 @@
 Origem: uma nota externa e a leitura direta do fork. Tudo abaixo marcado VERIFICADO foi conferido por mim no nosso código ou nos nossos logs; o resto é afirmação do fork ou da nota externa.
 
 ## O que o nosso próprio log diz que falta em cada quadro (VERIFICADO)
-- Build de diagnóstico, kit NVIDIA, Series S ((arquivo local, fora do repositório)), linha `dropped N/frame without a host pipeline: <motivo>`:
+- Build de diagnóstico, kit NVIDIA, Series S, linha `dropped N/frame without a host pipeline: <motivo>`:
   - **~900-940 por quadro: `left out: shades ray-tracing hits without BVH`**. É a iluminação do jogo (o ray tracing dele), deixada de fora de propósito porque o construtor de BVH está desligado. Uma constante (`VICTORY_AMBIENT=constant:0.8`) entra no lugar. É por isso que a imagem fica "chapada", com cara de pré-render (visto no jogo: a lâmpada da casa brilha mas não ilumina o deck).
   - 1 por quadro cada: computes sem tradução `02384a60fda6f2d0`, `8b437ab61d8008fe` (erro "a lane mask exchange", é o #30), `477b52e73ddeb6f2`, `17af85f170e66f30`. Rodam uma vez por quadro: são passes de tela inteira. Candidatos aos retângulos (água, céu) e às sombras.
   - 1 por quadro: `skipped shader 39f0e9aeb156a61c` (lista de pulados).
-- Build release da mesma noite (`...023509-jogar-kit-nvidia-release`), 75 linhas no mundo: média de 5.995 draws, **301 draws sem pipeline e 901 execuções indiretas descartadas por quadro** (mínimo 178, máximo 999).
+- Build release da mesma noite, 75 linhas no mundo: média de 5.995 draws, **301 draws sem pipeline e 901 execuções indiretas descartadas por quadro** (mínimo 178, máximo 999).
   - **Correção (03:05):** esses ~300 draws sem pipeline NÃO são objetos de cena. Pela pesquisa anterior (`2026-11-27-defeitos-visuais.md`): 258-283 são estágios do construtor de ray tracing, 1 é o defrag e 1 a ativação de raios (`39f0e9aeb156a61c` = `CS_ScreenProbes_ActivateRays`). Os ~900 "indirect" são os `CS_RaytracingResolve` deixados de fora. Ou seja: quase tudo o que falta no quadro é ray tracing.
 - Tempo: 74 ms de quadro com 57 ms de preparo (cópias 14,5 ms / 95 MB; texturas 15 ms / 326 MB) e 17 ms copiando de volta. A placa espera o processador (bate com o overlay do Bruno: 99% de uso com 100 W).
 
 ## Corte dos dispatches indiretos em 65.535 (VERIFICADO no código; NÃO é a causa em Series S)
-- `crates/victory-gpu/src/indirect.rs:285`: `if amd && on { 1 << 20 } else { 65_535 }`. O próprio comentário do nosso código descreve o defeito: em 2560x1440 a lista de tiles tem 67.440 grupos e perde os últimos 1.905 (a faixa de baixo da imagem).
+- `crates/victory-gpu/src/indirect.rs` (`widest`), antes do port: `if amd && on { 1 << 20 } else { 65_535 }`. Depois do `eeba481` a decisão está em `wide_card`. O próprio comentário do nosso código descreve o defeito: em 2560x1440 a lista de tiles tem 67.440 grupos e perde os últimos 1.905 (a faixa de baixo da imagem).
 - Tiles são de 8x4 pixels. Em Series S (1920x1080) são 64.800 no total: abaixo do corte. **Só dispara em Series X** (2560x1440), que é o perfil que o `Play-VIctory.cmd` usa (linha 57-59: "series-s drops the head/skin meshes on an 8 GB card"). Nós rodamos tudo em Series S.
 - Conserto: mgrein `b2f561e` + `8f2ac66` (só `indirect.rs`; testado por ele numa RTX 4070 com o teste `card_runs_wide_indirect_dispatches`). A/B: `VICTORY_INDIRECT_WIDE=0`.
 
@@ -44,12 +44,12 @@ Origem: uma nota externa e a leitura direta do fork. Tudo abaixo marcado VERIFIC
 - **Ray tracing nativo (DXR 1.1):** ~15 mil linhas de outro autor (maren-halv/VIctory-DXR). Numa 4070: 153 ms com a caminhada emulada, 108 ms com ray queries (6,5 para 9,3 FPS), pico de ~31 GB de memória privada. O README diz que ninguém conferiu a olho se os interiores ficam iluminados. Numa RX 9070 XT o FPS não mudou (11,6 contra 11,7), porque o limite é o processador.
 - **O que vale para o FPS, pela ordem do scout:** (1) só configuração: portas ligadas, `VICTORY_CARD_AWAKE` desligada, `VICTORY_PIPELINE_BOOK=0`; o nosso kit está ao contrário nas três; lá, o conjunto levou uma área pesada de 80 para 64 ms numa 4070. (2) REAPER `a2cf68b` (~90 linhas, risco baixo): na 4070 as resets de lista e a soltura de objetos aposentados eram ~2/7 da thread de envio; sem número de FPS. (3) pilha de cópias de views (`982b9f0`, `54ef67f`, `f9bcd8a`, `b1737be`, `c263560`+`fc02789`, `6381d40`; ~1.900 linhas, risco médio-alto): criar views custava de 1/5 a 1/3 de cada thread de tradução; é a mesma área da regressão do #28.
 - **NÃO se aplica a nós:** `cc94c34` (pool de listas em PC de 32 GB): o nosso `list.rs:256` já mantém 512 listas e não tem o trim de 4 GiB (VERIFICADO).
-- **Hipótese reforçada para os retângulos na água:** a nossa lista `scene_kernel` força a forma aproximada em seis programas; a árvore do mgrein não força. Teste: `VICTORY_WAVE_WIDE=0` (esfria o cache).
+- **Hipótese reforçada para os retângulos na água:** a nossa lista de programas que liga `scene_kernel` força a forma aproximada em seis programas; a árvore do mgrein não força. Teste: `VICTORY_WAVE_WIDE=0` (esfria o cache).
 - **Pergunta aberta:** por que o nosso kit força `PORT_CONSTANTS=0` e `PORT_CBV=0` na NVIDIA (defeito visto em placa de 8 GB, segundo a nota externa)?
 
 ## Captura com giro de 360 graus (exigência do Bruno, 02:50)
-- Hoje não dá: `VICTORY_KEYS` só aperta botões (`gameinput.rs:66`, setas = direcional), sem eixo de stick; a captura salva potências de dois e listas (`capture.rs`), meio tamanho, só no build de diagnóstico.
-- Pedido ao worker: eixo em `VICTORY_KEYS` (ex.: `40-52:RX+`) e `VICTORY_CAPTURE_EVERY_MS` (por tempo desde o primeiro quadro do mundo). Tem de entrar nos dois builds comparados.
+- Antes do `b5b2513` não dava: `VICTORY_KEYS` só apertava botões (`gameinput.rs`, setas = direcional), sem eixo de stick; a captura salva potências de dois e listas (`capture.rs`), meio tamanho, só no build de diagnóstico.
+- Feito no `b5b2513`: eixo em `VICTORY_KEYS` (ex.: `40-52:RX+`) e `VICTORY_CAPTURE_EVERY_MS` (por tempo desde o primeiro quadro do mundo). Tem de entrar nos dois builds comparados.
 - Roteiro pedido à pi: mundo + 20 s; rajada parada de ~10 quadros (flicker = diferença entre quadros vizinhos); giro completo em ~12 s com ~24 prints; rajada parada no fim; folha de contato lado a lado.
 
 ## Series S contra Series X (VERIFICADO em `console.rs`)
@@ -57,18 +57,18 @@ Origem: uma nota externa e a leitura direta do fork. Tudo abaixo marcado VERIFIC
 - O modo automático só escolhe Series X com 48 GB de RAM e 12 GB de VRAM; o README fala em 40-46 GB privados em X num PC de 64 GB. A máquina do Bruno tem 31 GB e já usa ~24 GB em S: X provavelmente não cabe. Uma rodada vigiada só.
 
 ## Atualização 02:55: roteiro final da captura com giro (pi + worker)
-- Comparador da pi pronto: (arquivo local, fora do repositório) (`run` e `compare`); casa base e candidato pelo tempo desde o primeiro quadro do mundo (linhas "frame saved" do log). Saídas: folha de contato por ângulo (base | candidato | mapa de diferença), número de pisca por rajada, draws descartados por motivo, `resumo.json`. Testado nas capturas antigas do A/B da árvore (114 blocos, igual a antes).
+- Comparador da pi pronto: script local (`run` e `compare`); casa base e candidato pelo tempo desde o primeiro quadro do mundo (linhas "frame saved" do log). Saídas: folha de contato por ângulo (base | candidato | mapa de diferença), número de pisca por rajada, draws descartados por motivo, `resumo.json`. Testado nas rodadas antigas do A/B da árvore (114 blocos, igual a antes).
 - Commit de diagnóstico pedido ao worker, quatro peças: eixo do stick em `VICTORY_KEYS` (`RX+` etc.); prefixo `w` para tempo desde o mundo (`w22-w34:RX+`); `VICTORY_CAPTURE_EVERY_MS` (+ `VICTORY_CAPTURE_MOST`); `VICTORY_CAPTURE_BURST_MS="20000:10,45000:10"`. Precisa estar na base e no candidato.
 - Roteiro: rajada de 10 quadros aos 20 s; giro de w22 a w34 com 500 ms (~24 prints, um a cada ~15 graus); rajada aos 40 s; fecha aos 45 s.
 - Ordem com o jogo livre: (i) teste real dos dois atalhos do PR #33; (ii) comparação base contra candidato; (iii) matriz N.
 
 ## Atualização 02:57: tarefa A construída, e por que ela não muda o que o Bruno vê em Series S
-- `port/mgrein-nvidia-fixes` `eeba481` = `play/melhor-ate-agora` `64b9e8c` + `69c50a0` (d4b8094) + `019b8ba` (b2f561e) + `eeba481` (8f2ac66), `cherry-pick -x`. Dois conflitos pequenos resolvidos à mão (`HostHeap::new`; `make_from`). Testes novos do `victory-gpu` passam. Exe em `.worktrees\_target-shared\release` e `\diag` (02:54-02:56).
-- **VERIFICADO por mim no log da T1 (diagnóstico, kit NVIDIA, Series S):** linha `dynamic slots: N tables asked, N refused` (`copystat.rs:1303`): 72 linhas, até 28.264 tabelas pedidas por quadro, **0 recusadas**. A reserva de tabelas não seca aqui em Series S: a A1 não é a causa da vegetação piscando nesta máquina. A A2 só dispara em 2560x1440. As duas valem para Series X.
+- `port/mgrein-nvidia-fixes` `eeba481` = `play/melhor-ate-agora` `64b9e8c` + `69c50a0` (d4b8094) + `019b8ba` (b2f561e) + `eeba481` (8f2ac66), `cherry-pick -x`. Dois conflitos pequenos resolvidos à mão (`HostHeap::new`; `make_from`). Testes novos do `victory-gpu` passam.
+- **VERIFICADO por mim no log da T1 (diagnóstico, kit NVIDIA, Series S):** linha `dynamic slots: N tables asked, N refused` (`copystat.rs`): 72 linhas, até 28.264 tabelas pedidas por quadro, **0 recusadas**. A reserva de tabelas não seca aqui em Series S: a A1 não é a causa da vegetação piscando nesta máquina. A A2 só dispara em 2560x1440. As duas valem para Series X.
 - Não provado: se o teste `card_runs_wide_indirect_dispatches` rodou de fato os 2^20 grupos nesta placa (ele retorna em silêncio quando a placa não é larga); efeito das duas em Series X.
 - Target compartilhado: ganho pequeno (2º build de outra worktree: 188 s, igual a um build frio de 187 s). Decisão: voltar ao target por worktree.
 - **Consequência:** as suspeitas para os defeitos em Series S passam a ser chaves que já existem: `VICTORY_WAVE_WIDE=0` (retângulos), `VICTORY_TEXTURE_NO_WAIT=0` / `VICTORY_UPLOAD_AHEAD=0` (braço e escada pretos), guarda de textura no padrão. Plano em blocos passado à pi (visual antes de FPS).
 
 ## Correção 03:05: as duas causas da nota externa já estavam descartadas na nossa pesquisa
 - `2026-11-27-consertos-em-outros-ports.md` já dizia: recusa de tabelas no heap de 1.000.000 "descartado para a nossa cena (0 recusadas por quadro)" e corte em 65.535 "descartado para a nossa cena: maior pedido nosso 1.368". Portei mesmo assim por não reler os relatórios depois da compactação. Vale só para Series X.
-- Suspeita que sobra para retângulos na água E vegetação piscando: a lista `scene_kernel` (`emit/mod.rs:625-640`) que força a forma wide em seis programas (`CS_TransmissionVolumetrics_Tiled`, `_LocalLights`, `CS_Tree_BatchCull`, `_ImposterOnly`, `CS_Visibility`). Teste: `VICTORY_WAVE_WIDE=0`. Conserto de verdade: forma paired do fxceless (#854 parte paired + #1419).
+- Suspeita que sobra para retângulos na água E vegetação piscando: a lista de programas que liga `scene_kernel` (`emit/mod.rs:625-640`) que força a forma wide em seis programas (`CS_TransmissionVolumetrics_Tiled`, `_LocalLights`, `CS_Tree_BatchCull`, `_ImposterOnly`, `CS_Visibility`). Teste: `VICTORY_WAVE_WIDE=0`. Conserto de verdade: forma paired do fxceless (#854 parte paired + #1419).
