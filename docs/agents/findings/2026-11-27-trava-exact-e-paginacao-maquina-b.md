@@ -110,3 +110,36 @@ As janelas são uma segunda cópia de memória que o jogo já tem. Elas ficam fi
 - 15 FPS na máquina B pede também cortar a paginação (item 5).
 
 **Como medir cada passo:** `VICTORY_TIMELINE` nos mesmos horários, mais o amostrador de paginação (`paging.ps1`, WMI; os contadores do `typeperf` têm nomes traduzidos neste Windows em português), comparando a seção "list calls of 50 us or more" e as esperas por local.
+
+## Com o PR #56 (`EXACT_LAZY` e afins): branch `test/smallram-night`, 27/11 à noite
+Branch `test/smallram-night` (`7df2b25`): o PR #56 com os commits do PR #57. Rodada com `-SmallRam` e a linha do tempo aos 300, 600, 900 e 1200 s. Uma rodada, cenas que andam sozinhas e parte jogada.
+
+| | Sem o PR #56 (rodada longa `texmax`, 33 min) | Com o PR #56 (20 min) |
+|---|---|---|
+| FPS no mundo, mediana (linhas com mais de 1.500 draws) | 4,9 | **7,2** |
+| Quadro, mediana | 204 ms | 139 ms |
+| Draws por quadro, mediana | 5.846 | 6.261 |
+| Placa ocupada (relógio do port), mediana | ~44% | **81%** |
+| Quedas e falhas de upload | 0 e 296 | 0 e 0 |
+
+**Espera na trava `shadow::exact`** dentro das chamadas de lista longas, somando as threads:
+
+| Momento | Espera | O que mais pesa na cadeia do quadro |
+|---|---|---|
+| Sem o PR #56, 300 s | 1.213 ms em 501 ms de gravação (2,42 por ms) | as chamadas de lista longas |
+| Com o PR #56, 300 s | 975 ms em 641 ms (1,52 por ms) | as chamadas de lista longas |
+| Com o PR #56, 600 s | 776 ms | **a placa executando**, 55 ms por quadro |
+| Com o PR #56, 900 s (cena pesada, 310 ms por quadro) | 911 ms, mais 242 ms em `resource::texture_at_global` | as chamadas de lista longas, 91 ms por quadro |
+| Com o PR #56, 1200 s | 386 ms | **a placa executando**, 120 de 181 ms por quadro |
+
+**Leitura:**
+- **O `EXACT_LAZY` corta ~37% da espera na trava, mas não a elimina.** O que sobra é o que ele não toca: a criação e o zeramento do buffer dentro da trava, e a disputa entre as ~2 mil buscas por quadro.
+- **Na máquina B, com a trava aliviada, a placa (RTX 5060) vira o limite em boa parte das cenas**, mesmo com render interno de ~853x480. Placa ocupada numa resolução tão baixa aponta para trabalho que não depende de pixels. Os suspeitos:
+  - leituras pela PCIe das cópias que ficam na RAM: a 5060 tem PCIe 5.0 x8, metade das lanes da 4080;
+  - a fila de cópia;
+  - os passes que limitam argumentos de `ExecuteIndirect`;
+  - o custo dos shaders traduzidos.
+
+  Próxima medida: `VICTORY_GPU_TIMING`, que cronometra cada lista na placa.
+- **Nas cenas pesadas, as travas das threads de gravação voltam a mandar.** O próximo código continua sendo a `EXACT` (criação fora da trava, varredura fora do miss), com a `texture_at_global` em seguida.
+- **Na máquina A, os ~70 ms por quadro de "o jogo ainda não enviou"** com a branch sem o PR #56 (comentário do Lago no PR #57) são essas mesmas travas. Lá a placa sobra, então elas são o limite inteiro.
