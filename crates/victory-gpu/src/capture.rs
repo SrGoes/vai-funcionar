@@ -138,6 +138,89 @@ fn world_on() -> bool {
 /// The first frame that ran 500 draws or more (`VICTORY_CAPTURE_WORLD`).
 static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
+/// When [`WORLD`] was presented.
+static WORLD_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// How long ago the first frame of the world was presented (`VICTORY_CAPTURE_WORLD`):
+/// the clock of the timed captures here and of `VICTORY_KEYS` entries counted from the
+/// world (`w<seconds>`), so that a script falls on the same moment of the scene in builds
+/// whose frames take different times. `None` before it.
+pub(crate) fn world_elapsed() -> Option<std::time::Duration> {
+    WORLD_AT.get().map(std::time::Instant::elapsed)
+}
+
+/// `VICTORY_CAPTURE_BURST_MS`: `<ms>:<frames>,...`, that many frames in a row from each
+/// moment after the first frame of the world.
+fn parse_bursts(list: &str) -> Vec<(u64, u32)> {
+    list.split(',')
+        .filter_map(|b| {
+            let (at, n) = b.split_once(':')?;
+            Some((at.trim().parse().ok()?, n.trim().parse().ok()?))
+        })
+        .collect()
+}
+
+/// What the timed captures decided for the frames so far.
+#[derive(Default)]
+struct Timed {
+    /// The last frame asked about, and the answer (a frame is asked more than once).
+    last: Option<(u64, bool)>,
+    /// When the next `VICTORY_CAPTURE_EVERY_MS` frame is due, and how many were saved.
+    next_every: u64,
+    saved: u32,
+    /// `VICTORY_CAPTURE_BURST_MS`: from when, and how many frames are left.
+    bursts: Vec<(u64, u32)>,
+}
+
+impl Timed {
+    /// Whether the frame presented `ms` after the world's first is saved: one every
+    /// `every` ms (0: none), at most `most` of them, and those of the bursts.
+    fn decide(&mut self, ms: u64, every: u64, most: u32) -> bool {
+        let mut yes = false;
+        if every > 0 && self.saved < most && ms >= self.next_every {
+            self.saved += 1;
+            self.next_every = (ms / every + 1) * every;
+            yes = true;
+        }
+        for (from, left) in &mut self.bursts {
+            if ms >= *from && *left > 0 {
+                *left -= 1;
+                yes = true;
+            }
+        }
+        yes
+    }
+}
+
+/// Whether frame `n` is one of the timed captures (`VICTORY_CAPTURE_EVERY_MS`,
+/// `VICTORY_CAPTURE_MOST`, default 64; `VICTORY_CAPTURE_BURST_MS`), counted from the
+/// first frame of the world. By time, not by frame number: at 3 or at 12 frames a second
+/// the same file is the same moment of a scripted scene.
+fn timed(n: u64) -> bool {
+    static SETTINGS: std::sync::OnceLock<(u64, u32)> = std::sync::OnceLock::new();
+    static STATE: std::sync::Mutex<Option<Timed>> = std::sync::Mutex::new(None);
+    let (every, most) = *SETTINGS.get_or_init(|| {
+        let env = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
+        (env("VICTORY_CAPTURE_EVERY_MS").unwrap_or(0), env("VICTORY_CAPTURE_MOST").map_or(64, |m| m as u32))
+    });
+    let Some(since) = world_elapsed() else {
+        return false;
+    };
+    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let state = state.get_or_insert_with(|| Timed {
+        bursts: parse_bursts(&std::env::var("VICTORY_CAPTURE_BURST_MS").unwrap_or_default()),
+        ..Timed::default()
+    });
+    if let Some((frame, yes)) = state.last
+        && frame == n
+    {
+        return yes;
+    }
+    let yes = state.decide(since.as_millis() as u64, every, most);
+    state.last = Some((n, yes));
+    yes
+}
+
 /// At the present of `frame`: the draws run on the host so far.
 pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     use std::sync::atomic::Ordering::Relaxed;
@@ -147,6 +230,7 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
         && drawn.saturating_sub(before) >= 500
         && WORLD.compare_exchange(u64::MAX, frame, Relaxed, Relaxed).is_ok()
     {
+        let _ = WORLD_AT.set(std::time::Instant::now());
         tracing::info!(frame, "the first frame of 500 draws or more: frames {} and {} are captured", frame + 2, frame + 6);
         #[cfg(feature = "diagnostics")]
         if let Some(folder) = folder() {
@@ -167,7 +251,7 @@ pub(crate) fn wanted(n: u64) -> bool {
     // run, so single frames cannot be compared between runs).
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
-    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
+    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world || timed(n))
 }
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
@@ -196,7 +280,11 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
     let png = encode(w, h, &raw);
     let path = folder.join(format!("{name}.png"));
     match std::fs::write(&path, png) {
-        Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
+        Ok(()) => tracing::info!(
+            path = %path.display(),
+            world_ms = world_elapsed().map(|d| d.as_millis() as u64),
+            "frame saved"
+        ),
         Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
     }
 }
@@ -951,6 +1039,20 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn timed_captures_fall_on_the_same_moments_at_any_frame_rate() {
+        // One every 500 ms, at most 3, and a burst of 2 frames from 1,200 ms.
+        let run = |frame_ms: u64| {
+            let mut t = super::Timed { bursts: super::parse_bursts("1200:2, bad, 9000:x"), ..Default::default() };
+            (0..40u64).map(|f| f * frame_ms).filter(|&ms| t.decide(ms, 500, 3)).collect::<Vec<_>>()
+        };
+        // At 10 frames a second: 0, 500, 1000, then the burst at 1200 and 1300.
+        assert_eq!(run(100), [0, 500, 1000, 1200, 1300]);
+        // At 4 a second the frames saved are the first ones at or after the same moments.
+        assert_eq!(run(250), [0, 500, 1000, 1250, 1500]);
+        assert_eq!(super::parse_bursts("20000:10,45000:10"), [(20000, 10), (45000, 10)]);
+    }
+
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);

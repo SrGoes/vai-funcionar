@@ -116,6 +116,27 @@ trait Source: Send {
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
+    #[cfg(windows)]
+    let axes = host::scripted_axes();
+    #[cfg(not(windows))]
+    let axes = [0.0; 4];
+    with_axes(keyboard_pad(keys), axes)
+}
+
+/// `pad` with `axes` (left x, left y, right x, right y) added to its sticks.
+fn with_axes(pad: PadState, axes: [f32; 4]) -> PadState {
+    let add = |v: f32, a: f32| (v + a).clamp(-1.0, 1.0);
+    PadState {
+        left_x: add(pad.left_x, axes[0]),
+        left_y: add(pad.left_y, axes[1]),
+        right_x: add(pad.right_x, axes[2]),
+        right_y: add(pad.right_y, axes[3]),
+        ..pad
+    }
+}
+
+/// The stand-in pad the keys held make.
+fn keyboard_pad(keys: &[KeyState]) -> PadState {
     let on = |vk: u8| {
         if keys.iter().any(|k| k.virtual_key == vk) {
             1.0
@@ -150,6 +171,104 @@ fn merged(a: PadState, b: PadState) -> PadState {
         right_x: further(a.right_x, b.right_x),
         right_y: further(a.right_y, b.right_y),
     }
+}
+
+/// When a `VICTORY_KEYS` entry begins or ends: seconds after input starts, or after the
+/// first frame of the world (`w<seconds>`; needs `VICTORY_CAPTURE_WORLD` and a build with
+/// diagnostics, which detect it), so a script falls on the same moment of the scene
+/// however long the menus took.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum When {
+    Input(Duration),
+    World(Duration),
+}
+
+/// What a `VICTORY_KEYS` entry holds: a key, or a stick axis pushed all the way
+/// (index: left x, left y, right x, right y; up and right positive).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Press {
+    Key(u8),
+    Axis(usize, f32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Scripted {
+    from: When,
+    to: When,
+    what: Press,
+}
+
+/// `VICTORY_KEYS=<when>:<key>,...`: a key held 0.2 s, or from `<when>-<when>` all that
+/// time. A key is a letter, a digit, `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
+/// `Left`, `Right` (the stand-in pad's table maps them to buttons), or a stick axis
+/// `LX+`, `LX-`, `LY+`, `LY-`, `RX+`, `RX-`, `RY+`, `RY-` (added to the pad of
+/// slot 0 and to the stand-in, as the keys' buttons are). A time is seconds, or
+/// `w<seconds>` after the first frame of the world. Entries that do not parse are left out.
+fn parse_script(list: &str) -> Vec<Scripted> {
+    list.split(',')
+        .filter_map(|entry| {
+            let (at, key) = entry.split_once(':')?;
+            let what = match key.trim() {
+                "Enter" => Press::Key(0x0D),
+                "Esc" => Press::Key(0x1B),
+                "Tab" => Press::Key(0x09),
+                "Back" => Press::Key(0x08),
+                "Up" => Press::Key(0x26),
+                "Down" => Press::Key(0x28),
+                "Left" => Press::Key(0x25),
+                "Right" => Press::Key(0x27),
+                axis @ ("LX+" | "LX-" | "LY+" | "LY-" | "RX+" | "RX-" | "RY+" | "RY-") => {
+                    let index = match &axis[..2] {
+                        "LX" => 0,
+                        "LY" => 1,
+                        "RX" => 2,
+                        _ => 3,
+                    };
+                    Press::Axis(index, if axis.ends_with('+') { 1.0 } else { -1.0 })
+                }
+                k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => Press::Key(k.as_bytes()[0].to_ascii_uppercase()),
+                _ => return None,
+            };
+            let time = |t: &str| {
+                let t = t.trim();
+                let (world, secs) = match t.strip_prefix('w') {
+                    Some(rest) => (true, rest),
+                    None => (false, t),
+                };
+                let d = Duration::try_from_secs_f64(secs.trim().parse().ok()?).ok()?;
+                Some(if world { When::World(d) } else { When::Input(d) })
+            };
+            let later = |w: When| match w {
+                When::Input(d) => When::Input(d + Duration::from_millis(200)),
+                When::World(d) => When::World(d + Duration::from_millis(200)),
+            };
+            let (from, to) = match at.split_once('-') {
+                Some((from, to)) => (time(from)?, time(to)?),
+                None => (time(at)?, later(time(at)?)),
+            };
+            Some(Scripted { from, to, what })
+        })
+        .collect()
+}
+
+/// The keys and stick axes `script` holds `input` after input started and `world` after
+/// the first frame of the world (`None`: not yet, or not known).
+fn script_now(script: &[Scripted], input: Duration, world: Option<Duration>) -> (Vec<u8>, [f32; 4]) {
+    let reached = |w: When| match w {
+        When::Input(d) => Some(input >= d),
+        When::World(d) => world.map(|now| now >= d),
+    };
+    let mut keys = Vec::new();
+    let mut axes = [0.0f32; 4];
+    for s in script {
+        if reached(s.from) == Some(true) && reached(s.to) == Some(false) {
+            match s.what {
+                Press::Key(vk) => keys.push(vk),
+                Press::Axis(i, v) => axes[i] = (axes[i] + v).clamp(-1.0, 1.0),
+            }
+        }
+    }
+    (keys, axes)
 }
 
 /// Whether the title sees one pad that is always there, fed by the keyboard
@@ -1203,6 +1322,7 @@ mod host {
                         pad.buttons |= button;
                     }
                 }
+                pad = super::with_axes(pad, scripted_axes());
             }
             Some(pad)
         }
@@ -1243,43 +1363,25 @@ mod host {
 
     /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
     /// 0.2 s that long after input starts (`<from>-<to>:<key>`: all that
-    /// time), with or without focus. A key is a
-    /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
-    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
+    /// time), with or without focus ([`super::parse_script`]).
     fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, Duration, u8)>)> = LazyLock::new(|| {
-            let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
-            let keys = list.split(',').filter_map(|entry| {
-                let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
-                let time = |t: &str| Duration::try_from_secs_f64(t.trim().parse().ok()?).ok();
-                let (from, to) = match at.split_once('-') {
-                    Some((from, to)) => (time(from)?, time(to)?),
-                    None => (time(at)?, time(at)? + Duration::from_millis(200)),
-                };
-                Some((from, to, vk))
-            });
-            (Instant::now(), keys.collect())
-        });
-        let (start, keys) = &*SCRIPT;
-        let now = start.elapsed();
-        keys.iter()
-            .filter(|&&(from, to, _)| (from..to).contains(&now))
-            .map(|&(_, _, vk)| vk)
-            .collect()
+        script_state().0
+    }
+
+    /// The stick axes `VICTORY_KEYS` holds now (left x, left y, right x, right y).
+    pub(super) fn scripted_axes() -> [f32; 4] {
+        script_state().1
+    }
+
+    fn script_state() -> (Vec<u8>, [f32; 4]) {
+        static SCRIPT: LazyLock<(Instant, Vec<super::Scripted>)> =
+            LazyLock::new(|| (Instant::now(), super::parse_script(&std::env::var("VICTORY_KEYS").unwrap_or_default())));
+        let (start, script) = &*SCRIPT;
+        #[cfg(feature = "diagnostics")]
+        let world = victory_gpu::world_elapsed();
+        #[cfg(not(feature = "diagnostics"))]
+        let world = None;
+        super::script_now(script, start.elapsed(), world)
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
@@ -1534,6 +1636,22 @@ mod tests {
         let rest = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
         assert_eq!(pad(rest), PadState::default());
         release(rest);
+    }
+
+    /// `VICTORY_KEYS` entries: keys and stick axes, from input start or from the world.
+    #[test]
+    fn scripts_hold_keys_and_sticks_from_input_or_from_the_world() {
+        let s = parse_script("10:Enter, w22-w34:RX+, 5-6:LY-, w1:Q, 3:Nope, x:Enter");
+        assert_eq!(s.len(), 4);
+        let secs = Duration::from_secs_f64;
+        // Before the world: only what counts from input start.
+        assert_eq!(script_now(&s, secs(10.1), None), (vec![0x0D], [0.0; 4]));
+        assert_eq!(script_now(&s, secs(5.5), None), (vec![], [0.0, -1.0, 0.0, 0.0]));
+        // The world began 30 s ago: the right stick is pushed right; the 0.2 s key is over.
+        assert_eq!(script_now(&s, secs(80.0), Some(secs(30.0))), (vec![], [0.0, 0.0, 1.0, 0.0]));
+        assert_eq!(script_now(&s, secs(80.0), Some(secs(34.0))).1, [0.0; 4]);
+        assert_eq!(script_now(&s, secs(80.0), Some(secs(1.1))).0, vec![b'Q']);
+        assert_eq!(with_axes(PadState { right_x: 1.0, ..Default::default() }, [0.0, 0.0, 1.0, -1.0]).right_x, 1.0);
     }
 
     #[test]
