@@ -9459,7 +9459,7 @@ mod range_tests {
                 if x != y {
                     let d = (0..n).find(|&i| x[i] != y[i]).unwrap();
                     let ti = |w: &World| unsafe { *((w.title + at + d) as *const u8) };
-                    panic!("DEBUG round {round}: copy {c} at {at:#x}+{n:#x}: first diff at +{d}: model {} new {}; title model {} new {}", x[d], y[d], ti(&worlds[0]), ti(&worlds[1]));
+                    panic!("round {round}: copy {c} at {at:#x}+{n:#x}: first diff at +{d}: model {} new {}; title model {} new {}", x[d], y[d], ti(&worlds[0]), ti(&worlds[1]));
                 }
             }
         }

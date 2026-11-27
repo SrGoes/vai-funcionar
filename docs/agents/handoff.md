@@ -31,6 +31,21 @@ O trabalho acontece em duas máquinas, as duas com GeForce. Todo número diz de 
 - **Perfil de console:** o `Play-VIctory.cmd` escolhe pela memória do PC (Series S abaixo de 48 GB de RAM ou 12 GB de VRAM) e aceita `series-s` ou `series-x` como primeira palavra. Antes do PR #49 ele forçava Series X. Nada foi medido em Series X na máquina A.
 - As duas placas têm folga para o jogo: na máquina A a placa fica 43-54% ocupada e quem limita o FPS é o processador preparando cada quadro (ver abaixo).
 
+## Noite de 27/11 (máquina A, PR perf/night-1127)
+Medido pelo `bench.py` numa cena fixa (o save é restaurado antes de cada rodada: o título salva sozinho e trocou a cena original às 06:24), rota nvidia, Series S, build diag:
+
+| | ontem (main 5487f38) | noite (kit nvidia novo) |
+|---|---|---|
+| 3 rodadas de 100 s | 9,30 FPS, p50 95,7 ms, p99 262 ms | 12,1-13,4 FPS, p50 57,7 ms |
+| 15 min contínuos | 9,75 FPS, 1% low 3,14, p50 96, p99 219, sem crash | 15,44 FPS, 1% low 3,89, p50 58, p99 159, sem crash |
+
+- **O que limitava:** as 5 threads de gravação do título passavam 70-80 ms/quadro nas chamadas de lista, na maior parte esperando a trava `EXACT` (`shadow::exact`), que varria ~8.700 cópias a cada miss. Perfil por função: `VICTORY_TIMELINE_RECORDERS=1` com `VICTORY_TIMELINE`.
+- **O que entrou no kit nvidia** (`scripts/play.ps1`): `EXACT_LAZY` (varre a cada 64 misses; a maior parte do ganho), `COPY_BY_RANGE`, `FLUSH_GROUPED`, `CARD_STEPS_JOIN`, `PORT_GUARD`, `PORT_GUARD_PLAN`, `ASK_NORESET`. Fora do kit: `TEXTURE_ONCE_A_FRAME` (sem A/B de imagem), `PLACED_QUICK` e `THIN=1` (sem ganho).
+- **Sem ganho medido:** `WAVE_WIDE=0`, `UPSCALER=6`+`RENDER_SCALE=0.5` (a placa não limita), `settings.xml` com LOD menor (sem efeito nos draws), `VICTORY_OUTPUT=1280x720` (cai: FSR4 exige 1920x1080).
+- **Ray tracing:** o construtor (52 programas de `XboxBvhBuilder.dll`) traduz e valida em grupos de 32 (`VICTORY_HOST_MAX_WAVE=32 translate --validate`); rodada no jogo: ver `RELATORIO-AMANHA.md`.
+- **Ferramentas novas:** `VICTORY_FRAME_TIMES=<csv>` (tempo de cada quadro, para 1% low/p99), `VICTORY_AB` cobre as chaves novas.
+- **Memória:** o pico subiu de ~28,2 para ~29,1 GB em 15 min; a RAM livre chegou a ~120-320 MB em 32 GB. É o próximo risco.
+
 ## O que entrou na main em 27/11 (PRs #31 a #34)
 | Peça | Commits | Estado |
 |---|---|---|

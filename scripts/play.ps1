@@ -81,8 +81,10 @@ if ($Route -eq 'amd') {
         # (p50 96 -> 58 ms; 1% low did not improve). EXACT_LAZY is most of it: the
         # recording threads queued on the EXACT lock while it swept ~8,700 copies at
         # every miss. The others each gave 1.5-4.5 ms in A/B runs (VICTORY_AB).
+        # VICTORY_TEXTURE_ONCE_A_FRAME stays opt-in: with the guard off it can show a
+        # texture the title rewrote mid-frame a frame late, and no picture A/B was made.
         VICTORY_EXACT_LAZY = '1'; VICTORY_COPY_BY_RANGE = '1'; VICTORY_FLUSH_GROUPED = '1'
-        VICTORY_TEXTURE_ONCE_A_FRAME = '1'; VICTORY_CARD_STEPS_JOIN = '1'
+        VICTORY_CARD_STEPS_JOIN = '1'
         VICTORY_PORT_GUARD = '1'; VICTORY_PORT_GUARD_PLAN = '1'; VICTORY_ASK_NORESET = '1'
     }
     if ($LowMemory) {

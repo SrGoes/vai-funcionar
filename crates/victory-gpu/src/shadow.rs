@@ -5665,7 +5665,7 @@ const LAZY_CEILING: usize = 64 * MANY;
 
 /// Whether [`exact`] looks for idle copies now: never under `many` kept;
 /// then at each miss, or when lazy once [`LAZY_MISSES`] have passed since
-/// the last look or the map is at four times `many` (so it cannot grow
+/// the last look or the map is at [`LAZY_CEILING`] (so it cannot grow
 /// without bound while the copies are held).
 fn sweep_due(kept: usize, misses: u64, lazy: bool) -> bool {
     kept >= MANY && (!lazy || misses >= LAZY_MISSES || kept >= LAZY_CEILING)
