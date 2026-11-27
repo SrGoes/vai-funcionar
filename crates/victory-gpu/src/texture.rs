@@ -110,6 +110,8 @@ struct Last {
     /// first checks, and after the hash found a change the guard had not
     /// seen ([`hot_textures`]). 0: not checked under the guard yet.
     hot_until: u64,
+    /// The frame the texture was last hashed in ([`skip_rehash`]).
+    hashed_frame: Option<u64>,
 }
 
 /// Frames a guarded texture is hashed at every check from its first check,
@@ -131,6 +133,48 @@ const HOT_FRAMES: u64 = 64;
 fn hot_textures() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_HOT").is_none_or(|v| v != "0"))
+}
+
+/// Whether a texture hashed already in this frame is left alone at its next
+/// check (`VICTORY_TEXTURE_ONCE_A_FRAME=1`; A/B-able by that name). With
+/// the write guard off (`VICTORY_TEXTURE_GUARD=0`) every check hashes the
+/// whole texture, and a texture is checked several times a frame; a write
+/// the title makes between two checks of a frame shows up one frame later.
+fn once_a_frame() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_TEXTURE_ONCE_A_FRAME") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_TEXTURE_ONCE_A_FRAME").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Whether a check is skipped: the key is on, the texture was hashed in
+/// this very frame and the check is not an exact one.
+fn skip_rehash(once: bool, frame: u64, exact: bool, hashed_frame: Option<u64>) -> bool {
+    once && !exact && hashed_frame == Some(frame)
+}
+
+/// Notes that the texture was hashed now (and counts a repeat in a frame).
+fn note_hashed(last: &mut Last) {
+    let frame = crate::frame::current();
+    #[cfg(feature = "diagnostics")]
+    if last.hashed_frame == Some(frame) {
+        crate::copystat::add(crate::copystat::C::TexRehashed, 1);
+    }
+    last.hashed_frame = Some(frame);
+}
+
+/// Whether view memory is guarded against writes, so that a texture there
+/// is hashed only every eighth frame (`VICTORY_TEXTURE_GUARD=0`: at every
+/// check; A/B-able by that name).
+fn texture_guard() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_TEXTURE_GUARD") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -1317,6 +1361,9 @@ impl Staging {
         if alone && !exact && last.hash.is_some() {
             return 0;
         }
+        if skip_rehash(once_a_frame(), crate::frame::current(), exact, last.hashed_frame) {
+            return 0;
+        }
         if !alone && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
             if !exact && last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
@@ -1342,11 +1389,10 @@ impl Staging {
         // the hash, which is taken every eighth frame only, by the
         // texture's address, so the textures take turns.
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
-        static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         // The guard saw no write: a change the hash finds came another way.
         let mut blind = false;
         if !alone
-            && *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
+            && texture_guard()
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
             const HASH_EVERY: u64 = 8;
@@ -1410,6 +1456,7 @@ impl Staging {
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
                 let hash = digest(read);
+                note_hashed(last);
                 if last.hash == Some(hash) {
                     return false;
                 }
@@ -1432,6 +1479,7 @@ impl Staging {
         if through_copy() {
             return with_title(self.memory, size, |tiled| {
                 let hash = digest(tiled);
+                note_hashed(last);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
                 if last.hash == Some(hash) {
@@ -1449,6 +1497,7 @@ impl Staging {
         // stays committed while `_mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
         let hash = digest(tiled);
+        note_hashed(last);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
@@ -1476,6 +1525,7 @@ impl Staging {
                 return false;
             }
             let hash = digest(read);
+            note_hashed(last);
             if last.hash != Some(hash) {
                 last.hash = Some(hash);
                 self.detile(read);
@@ -1992,6 +2042,22 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod once_a_frame_tests {
+    use super::skip_rehash;
+
+    /// With the key off nothing is skipped; on, only a second look in the
+    /// frame that already hashed, and never an exact one.
+    #[test]
+    fn a_texture_is_hashed_once_a_frame_when_asked() {
+        assert!(!skip_rehash(false, 7, false, Some(7)));
+        assert!(skip_rehash(true, 7, false, Some(7)));
+        assert!(!skip_rehash(true, 7, true, Some(7)));
+        assert!(!skip_rehash(true, 8, false, Some(7)));
+        assert!(!skip_rehash(true, 7, false, None));
+    }
 }
 
 #[cfg(test)]

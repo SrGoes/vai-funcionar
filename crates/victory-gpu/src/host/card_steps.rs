@@ -524,6 +524,95 @@ fn fill_to(runs: &[&HostList], step: (usize, usize)) -> Option<FillTo> {
     }
 }
 
+/// Whether the places a submission's steps read are brought to the card in
+/// fewer, longer reads (`VICTORY_CARD_STEPS_JOIN=1`; off by default): where
+/// places of one host copy follow each other the way they lie in memory, as a
+/// ring of constants does (eight to a page), one read covers them all.
+///
+/// Why: a frame plans some 10,500 fills from the same ring; each place was a
+/// read of its own, a command to record and a look in two tables to find it.
+fn steps_join() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_CARD_STEPS_JOIN") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_CARD_STEPS_JOIN"))
+}
+
+/// One read into the buffer between: `[from, to)` of a host copy (`id`: its
+/// address) at `at`, for the steps of `level`.
+struct ReadRun<S> {
+    shadow: S,
+    id: usize,
+    from: usize,
+    to: usize,
+    at: u64,
+    level: u32,
+}
+
+/// Where in the buffer between each place read lands, and the reads that
+/// bring them there.
+struct Reads<S> {
+    join: bool,
+    runs: Vec<ReadRun<S>>,
+    /// The places read (host copy, address, bytes, level): where in the
+    /// buffer between their bytes are.
+    places: HashMap<(usize, usize, usize, u32), u64>,
+    /// Where the next place goes: each is at a multiple of 256, as constant
+    /// buffers must be.
+    end: u64,
+}
+
+impl<S: Clone> Reads<S> {
+    fn new(join: bool) -> Self {
+        Reads { join, runs: Vec::new(), places: HashMap::default(), end: 0 }
+    }
+
+    /// Where the bytes `[src, src + len)` of host copy `id` (`shadow`) are in
+    /// the buffer between. A place that lies where the last read ends, or
+    /// within 255 bytes of it, at the distance from the read's start its
+    /// bytes have in memory, extends that read: the layout is the one each
+    /// place with a read of its own would have, the gap bytes are read too
+    /// and nothing looks at them. `mapped`: whether title memory of a range
+    /// can be read.
+    fn place(
+        &mut self,
+        shadow: &S,
+        id: usize,
+        src: usize,
+        len: usize,
+        level: u32,
+        mapped: &mut dyn FnMut(usize, usize) -> bool,
+    ) -> Result<u64, &'static str> {
+        if let Some(&at) = self.places.get(&(id, src, len, level)) {
+            return Ok(at);
+        }
+        if self.end + len as u64 > BETWEEN {
+            return Err("too much at once");
+        }
+        let at = self.end;
+        let extends = self.runs.last().filter(|r| {
+            self.join && r.id == id && r.level == level && src >= r.from && r.at + (src - r.from) as u64 == at
+        });
+        // (The gap is read from the host copy too: it must be mapped.)
+        let joined = extends.is_some_and(|r| mapped(r.to, src + len));
+        if !joined && !mapped(src, src + len) {
+            return Err("not all of what it reads is mapped");
+        }
+        if joined {
+            if let Some(r) = self.runs.last_mut() {
+                r.to = src + len;
+            }
+        } else {
+            self.runs.push(ReadRun { shadow: shadow.clone(), id, from: src, to: src + len, at, level });
+        }
+        self.end = (at + len as u64).next_multiple_of(256);
+        self.places.insert((id, src, len, level), at);
+        Ok(at)
+    }
+}
+
 /// A step done on the card.
 struct Op {
     from: (Arc<Shadow>, usize),
@@ -721,14 +810,11 @@ impl Host {
             all
         };
         let mut ops: Vec<Op> = Vec::with_capacity(chosen.len());
-        // The places read (host copy, address, bytes, level): where in the
-        // buffer between their bytes are.
-        let mut places: HashMap<(usize, usize, usize, u32), u64> = HashMap::default();
+        let mut reads: Reads<Arc<Shadow>> = Reads::new(steps_join());
         // Some 2,800 fills a frame, of a few hundred places: what holds each
         // is looked for once, as long as no copy is added to the writers.
         let mut held: HashMap<(usize, usize), Arc<Shadow>> = HashMap::default();
         let mut room = HashMap::default();
-        let mut end = 0u64;
         for &(i, level) in &chosen {
             let Some(((src, _), (dst, _))) = reads_writes(&does[i]) else {
                 continue;
@@ -747,22 +833,7 @@ impl Host {
                     from
                 }
             };
-            let place = (Arc::as_ptr(&from) as usize, src, len, level);
-            let at = match places.get(&place) {
-                Some(&at) => at,
-                None => {
-                    if end + len as u64 > BETWEEN {
-                        return Err("too much at once");
-                    }
-                    if !mapped(src, src + len, &mut room) {
-                        return Err("not all of what it reads is mapped");
-                    }
-                    let at = end;
-                    end = (end + len as u64).next_multiple_of(256);
-                    places.insert(place, at);
-                    at
-                }
-            };
+            let at = reads.place(&from, Arc::as_ptr(&from) as usize, src, len, level, &mut |a, b| mapped(a, b, &mut room))?;
             let to = match does[i] {
                 Does::Copy { .. } => {
                     let to = holder(&writers, dst, dst + len)?;
@@ -827,25 +898,25 @@ impl Host {
             }
         }
         #[cfg(feature = "diagnostics")]
-        own.list.note_op(|| format!("{} copies of title memory done on the card, {end} bytes (VICTORY_CARD_STEPS)", ops.len()));
+        own.list.note_op(|| format!("{} copies of title memory done on the card, {} bytes (VICTORY_CARD_STEPS)", ops.len(), reads.end));
         let levels = ops.iter().map(|op| op.level).max().unwrap_or(0);
         for level in 0..=levels {
-            let mut reads = Vec::new();
+            let from: Vec<_> = reads
+                .runs
+                .iter()
+                .filter(|r| r.level == level)
+                .map(|r| (&r.shadow.buffer, r.shadow.offset(r.from as u64), r.at, (r.to - r.from) as u64))
+                .collect();
             let mut writes = Vec::new();
             for op in ops.iter().filter(|op| op.level == level) {
                 let len = op.len as u64;
-                let read = (&op.from.0.buffer, op.from.0.offset(op.from.1 as u64), op.at, len);
-                // (Each place once.)
-                if places.remove(&(Arc::as_ptr(&op.from.0) as usize, op.from.1, op.len, level)).is_some() {
-                    reads.push(read);
-                }
                 match &op.to {
                     To::Copy(to, dst) => writes.push((&to.buffer, to.offset(*dst as u64), op.at, len)),
                     To::Buffer(buffer) => writes.push((buffer, 0, op.at, len)),
                     To::Slot(..) => {}
                 }
             }
-            record(level == 0, &own.list.list, &own.between, &reads, &writes);
+            record(level == 0, &own.list.list, &own.between, &from, &writes);
         }
         own.list.close();
         // SAFETY: a live buffer.
@@ -1168,6 +1239,115 @@ mod tests {
     fn what_no_host_copy_holds_is_refused() {
         let writers = [Writer { shadow: None, from: 100, to: 108, copy: false }];
         assert!(holder(&writers, 104, 120).is_err());
+    }
+
+    /// What a place's bytes are in memory, for a host copy and an address.
+    fn byte(id: usize, at: usize) -> u8 {
+        (at.wrapping_mul(2654435761) ^ id.wrapping_mul(40503)) as u8
+    }
+
+    /// Places as a ring of constants gives them out (eight to a page, a few
+    /// repeated, jumps, other lengths, other levels, another host copy),
+    /// laid out with and without the join: the same bytes in the same places.
+    #[test]
+    fn joined_reads_bring_the_same_bytes_to_every_place() {
+        const HOLE: (usize, usize) = (0x30_0000, 0x30_1000);
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        };
+        let (mut runs_plain, mut runs_joined) = (0, 0);
+        for round in 0..300 {
+            let mut at = 0x28ab_0000usize + (next(8) as usize) * 32;
+            let mut ops = Vec::new();
+            for _ in 0..400 {
+                let id = if next(40) == 0 { 2 } else { 1 };
+                match next(10) {
+                    0 => at += next(1 << 20) as usize,
+                    1 => at -= (at - 0x28ab_0000).min(next(4096) as usize),
+                    2 | 3 => {}
+                    4 => at += 4096 * next(3) as usize,
+                    _ => at += 512,
+                }
+                let len = [480, 480, 480, 64, 256, 20_480, 1][next(7) as usize];
+                ops.push((id, at, len, next(3) as u32));
+            }
+            let unmapped = |a: usize, b: usize| a < HOLE.1 && HOLE.0 < b;
+            let lay = |join: bool| {
+                let mut reads = Reads::<usize>::new(join);
+                let mut ats = Vec::new();
+                for &(id, src, len, level) in &ops {
+                    let got = reads.place(&id, id, src, len, level, &mut |a, b| !unmapped(a, b));
+                    let failed = got.is_err();
+                    ats.push(got);
+                    if failed {
+                        break;
+                    }
+                }
+                (reads, ats)
+            };
+            let (plain, plain_at) = lay(false);
+            let (joined, joined_at) = lay(true);
+            assert_eq!(joined_at, plain_at, "round {round}: where each place is, or that one is refused");
+            assert_eq!(joined.end, plain.end, "round {round}");
+            for (reads, label) in [(&plain, "plain"), (&joined, "joined")] {
+                // What the card copies into the buffer between.
+                let mut between = vec![None; reads.end as usize];
+                for r in &reads.runs {
+                    assert!(!unmapped(r.from, r.to), "{label}: reads what is not mapped");
+                    for a in r.from..r.to {
+                        let slot = &mut between[r.at as usize + a - r.from];
+                        assert!(slot.is_none(), "{label}, round {round}: two reads on the same byte");
+                        *slot = Some(byte(r.id, a));
+                    }
+                }
+                for (&(id, src, len, _), got) in ops.iter().zip(&plain_at) {
+                    let Ok(at) = *got else { continue };
+                    assert_eq!(at % 256, 0, "{label}: a constant buffer's place");
+                    let there: Vec<Option<u8>> = between[at as usize..at as usize + len].to_vec();
+                    let wanted: Vec<Option<u8>> = (src..src + len).map(|a| Some(byte(id, a))).collect();
+                    assert_eq!(there, wanted, "{label}, round {round}: the bytes of {src:#x}+{len:#x}");
+                }
+            }
+            runs_plain += plain.runs.len();
+            runs_joined += joined.runs.len();
+        }
+        assert!(runs_joined < runs_plain, "joined: {runs_joined} reads, plain: {runs_plain}");
+    }
+
+    /// A ring of constants, eight to a page, is one read.
+    #[test]
+    fn a_ring_of_constants_is_one_read() {
+        let mut reads = Reads::<usize>::new(true);
+        for i in 0..1000 {
+            reads.place(&1, 1, 0x28ab_0000 + i * 512, 480, 0, &mut |_, _| true).unwrap();
+            // (Once more: the same place, found.)
+            reads.place(&1, 1, 0x28ab_0000 + i * 512, 480, 0, &mut |_, _| true).unwrap();
+        }
+        assert_eq!(reads.runs.len(), 1);
+        assert_eq!(reads.runs[0].to - reads.runs[0].from, 999 * 512 + 480);
+    }
+
+    /// A gap that cannot be read starts a read of its own for the place
+    /// behind it, and a place whose own bytes cannot is refused as before.
+    #[test]
+    fn a_gap_that_is_not_mapped_does_not_join() {
+        // The 32 bytes between two places of a ring.
+        let mapped = |a: usize, b: usize| !(a < 0x1000 && 0x0fe0 < b);
+        let place = |reads: &mut Reads<usize>, src| reads.place(&1, 1, src, 480, 0, &mut |a, b| mapped(a, b));
+        let mut reads = Reads::<usize>::new(true);
+        assert_eq!(place(&mut reads, 0x0c00), Ok(0));
+        assert_eq!(place(&mut reads, 0x0e00), Ok(512));
+        assert_eq!(reads.runs.len(), 1);
+        assert_eq!(place(&mut reads, 0x1000), Ok(1024));
+        assert_eq!(reads.runs.len(), 2);
+        assert_eq!(place(&mut reads, 0x1200), Ok(1536));
+        assert_eq!(reads.runs.len(), 2);
+        assert_eq!(reads.runs[1].from..reads.runs[1].to, 0x1000..0x13e0);
+        assert_eq!(reads.place(&1, 1, 0x0ff0, 16, 0, &mut |a, b| mapped(a, b)), Err("not all of what it reads is mapped"));
     }
 
     /// Reads are all before writes, between two buffers and within one, and

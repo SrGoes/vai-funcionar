@@ -5633,14 +5633,46 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
 }
 
 /// Copies of single buffer views' own bytes ([`exact`]), by (start,
-/// bytes), each with the asking that last took it; and the askings so far.
+/// bytes), each with the asking that last took it; the askings so far; and
+/// the misses since the last look for idle ones ([`sweep_due`]).
 #[allow(clippy::type_complexity)]
-static EXACT: Mutex<(u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>)> = Mutex::new((0, BTreeMap::new()));
+static EXACT: Mutex<(u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>, u64)> = Mutex::new((0, BTreeMap::new(), 0));
 
 /// Since the last frame line: askings for such copies, copies made in a
 /// buffer made for them, and copies made in a buffer another one let go
 /// ([`EXACT_SPARE`]).
 static EXACT_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Whether [`exact`] looks for idle copies once every [`LAZY_MISSES`] misses
+/// instead of at each one (`VICTORY_EXACT_LAZY=1`; off by default). Each look
+/// walks every copy under the lock the title's recording threads queue on.
+fn exact_lazy() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_EXACT_LAZY") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_EXACT_LAZY").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Misses between two looks for idle copies when lazy.
+const LAZY_MISSES: u64 = 64;
+
+/// Past this many copies the lazy sweep runs at every miss again. The title keeps
+/// ~8,700 copies alive in the world (run fx-hoje, 27/11), so a ceiling of 4 * MANY
+/// (1,024) meant the lazy sweep never applied.
+const LAZY_CEILING: usize = 64 * MANY;
+
+/// Whether [`exact`] looks for idle copies now: never under `many` kept;
+/// then at each miss, or when lazy once [`LAZY_MISSES`] have passed since
+/// the last look or the map is at [`LAZY_CEILING`] (so it cannot grow
+/// without bound while the copies are held).
+fn sweep_due(kept: usize, misses: u64, lazy: bool) -> bool {
+    kept >= MANY && (!lazy || misses >= LAZY_MISSES || kept >= LAZY_CEILING)
+}
+
+/// Copies kept before the idle ones are looked for.
+const MANY: usize = 256;
 
 /// Whether a copy of a view's own bytes takes the buffer one let go had
 /// (on by default; `VICTORY_VIEW_BYTES_REUSE=0`: every copy gets a buffer
@@ -5741,9 +5773,7 @@ pub(crate) fn let_go_spare_views() {
 /// change every frame), and the next copy of as many bytes takes the buffer
 /// of one that went, zeroed as a new one is ([`exact_reuse`]).
 pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    /// Copies kept before the idle ones are looked for, and the askings an
-    /// idle one stays for.
-    const MANY: usize = 256;
+    /// The askings an idle copy stays for.
     const LATELY: u64 = 512;
     /// The largest, and no view the title made on purpose: off its dwords.
     const MOST: u64 = 64 << 20;
@@ -5754,7 +5784,7 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     }
     EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
     let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
-    let (tick, map) = &mut *guard;
+    let (tick, map, misses) = &mut *guard;
     *tick += 1;
     let now = *tick;
     if let Some((shadow, used)) = map.get_mut(&(address, len)) {
@@ -5762,7 +5792,9 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         shadow.used.store(crate::host::moment(), Ordering::Relaxed);
         return Some(shadow.clone());
     }
-    if map.len() >= MANY {
+    *misses += 1;
+    if sweep_due(map.len(), *misses, exact_lazy()) {
+        *misses = 0;
         // Held by the map alone, and its buffer by the copy alone (no slot
         // shows it), and not asked for lately. A list not yet sent holds the
         // copy (its `Arc`), and that keeps it here; one let go was at most in
@@ -5771,8 +5803,9 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         let after = crate::host::submissions().0;
         let mut spares = exact_reuse().then(|| EXACT_SPARE.lock().unwrap_or_else(|e| e.into_inner()));
         map.retain(|_, (shadow, used)| {
+            // The cheap tests first: `references` is an AddRef and a Release.
             let keep =
-                Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now;
+                *used + LATELY > now || Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1;
             if !keep && let Some(spares) = &mut spares {
                 let spare = Spare { buffer: shadow.buffer.clone(), data: shadow.data as usize };
                 spares.put(shadow.width(), spare, after, SPARE_MOST);
@@ -5836,7 +5869,29 @@ pub(crate) fn exact_line(frames: f64) {
 mod exact_tests {
     use std::sync::atomic::Ordering::Relaxed;
 
-    use super::{EXACT_STATS, Spares, exact, host};
+    use super::{EXACT_STATS, Spares, exact, host, sweep_due};
+
+    /// The sweep of the copies waits for 64 misses when lazy, but never past
+    /// the ceiling; below the first threshold it never runs.
+    #[test]
+    fn lazy_sweep_waits_for_misses_below_the_ceiling() {
+        // Below MANY: never, lazy or not.
+        assert!(!sweep_due(255, 1_000, false));
+        assert!(!sweep_due(255, 1_000, true));
+        // Eager: every miss at MANY or more (as before).
+        assert!(sweep_due(256, 0, false));
+        assert!(sweep_due(1_000, 1, false));
+        // Lazy: only from 64 misses on.
+        assert!(!sweep_due(256, 0, true));
+        assert!(!sweep_due(500, 63, true));
+        assert!(sweep_due(256, 64, true));
+        assert!(sweep_due(500, 1_000, true));
+        // Lazy over the ceiling: every miss, as eager (the map must not grow).
+        assert!(sweep_due(super::LAZY_CEILING, 0, true));
+        assert!(!sweep_due(super::LAZY_CEILING - 1, 0, true));
+        // The world's ~8,700 copies stay lazy.
+        assert!(!sweep_due(8_700, 0, true));
+    }
 
     /// A thing let go is taken by its width, once its submission finished,
     /// and no more bytes are kept than asked.

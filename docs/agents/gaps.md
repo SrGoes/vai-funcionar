@@ -24,6 +24,8 @@ Os defeitos vistos jogando estão numerados em `relatos.md`; aqui ficam as causa
 ## Desempenho e memória
 | Lacuna | O que se sabe | Próximo passo | Issue |
 |---|---|---|---|
+| 15 FPS (cena fixa, máquina A, kit novo) | Depois do `EXACT_LAZY` a trava `EXACT` deixa de dominar; as gravadoras ainda gastam a maior parte do quadro nas chamadas de lista (~14 µs por draw em `bind`/`tables_with_extents`/`readable`, 4 travas globais por textura) | Perfil com `VICTORY_TIMELINE_RECORDERS=1` depois do kit novo; travas de `resource.rs`/`texture.rs` | |
+| RAM livre ~120-320 MB em 32 GB | `EXACT_LAZY` mantém até 64 cópias ociosas a mais; o pico subiu ~0,9 GB em 15 min | Contar os bytes guardados pela `EXACT`; `VICTORY_TEXTURE_BUDGET_MB` | #2 |
 | 8-12 FPS | O processador limita: preparo 51-57 ms por quadro | Passos 3 e 4 do `handoff.md` | #10, #13 |
 | 24-25 GB de RAM | Conjunto de trabalho grande; vazamento de 30-50 MB por minuto em "our own allocations" e "distinct views kept", medido só numa sessão longa do build antigo | Três chaves do `handoff.md`; linha de log com a memória do jogo; contadores por tipo | #2, #3 |
 | Sem perfil do processador | O `wpr` da máquina grava e falha ao salvar (0x80010106) | Instalar o Windows Performance Toolkit ou outro caminho | |
