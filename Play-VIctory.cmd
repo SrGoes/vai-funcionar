@@ -5,6 +5,7 @@ rem the kit of settings (and prints it). Other arguments go to play.ps1, for exa
 rem   Play-VIctory.cmd -DryRun
 rem   Play-VIctory.cmd -Vars "VICTORY_THIN=1;VICTORY_LOG=info"
 rem Settings set in this window do not reach the title: play.ps1 starts from a clean kit.
+rem The route and the console are fixed here; for another console run play.ps1 itself.
 set "first=%~1"
 set "rest=%*"
 if not defined first goto checked

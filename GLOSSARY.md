@@ -30,6 +30,10 @@ _Avoid_: flag, switch, variável, opção
 Um conjunto de chaves aplicado junto por um script de abertura. Dois kits diferentes não são comparáveis.
 _Avoid_: perfil, preset, configuração
 
+**Rota**:
+O kit de chaves feito para uma marca de placa: rota nvidia (`Play-VIctory.cmd`, `scripts\play.ps1 -Route nvidia`) ou rota amd (`scripts\play.ps1 -Route amd`). Medir e jogar sempre pela rota da placa; números de rotas diferentes não se comparam.
+_Avoid_: launcher, perfil, modo
+
 **Perfil de console**:
 Qual Xbox o port finge ser, Series S ou Series X. Muda a resolução e a memória que o jogo usa.
 _Avoid_: modo, console
@@ -147,7 +151,7 @@ Uma das configurações de uma matriz.
 
 **Cena de medição**:
 O lugar fixo do save onde toda rodada mede. Hoje é a casa.
-_Avoid_: cenário, rota
+_Avoid_: cenário, rota (no sentido de caminho pelo mapa)
 
 ### O norte
 

@@ -55,7 +55,7 @@ if ($Route -eq 'amd') {
         $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'
     }
 } else {
-    # The kit of Play-VIctory.cmd (route tested on GeForce cards by the CGBJ group).
+    # The kit of Play-VIctory.cmd (the route tested on GeForce cards).
     $settings = @{
         VICTORY_AMBIENT_AIR = '1.5'; VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'
         VICTORY_CARD_REHASH_RUNS = '1'; VICTORY_JOIN_COPIES = '1'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_RELAY_COPY = '1'
@@ -70,7 +70,7 @@ if ($Route -eq 'amd') {
         VICTORY_TEXTURE_GUARD = '0'
         # The asynchronous submission paths stay off on NVIDIA: with THIN the head
         # skin of people in play is not drawn (eyes and teeth are), and JOIN_PARTS
-        # repeats frames of the opening video. Set them to 1 to try instead.
+        # repeats frames of the opening video. -Vars "VICTORY_THIN=1" to try instead.
         VICTORY_THIN = '0'; VICTORY_JOIN_PARTS = '0'
         # Renderer ports 1 & 5 stay opt-in: on 8 GB NVIDIA cards PORT_CBV=1 can drop
         # road surfaces and PORT_CONSTANTS+PORT_CBV can raise a C++ exception (#15).
