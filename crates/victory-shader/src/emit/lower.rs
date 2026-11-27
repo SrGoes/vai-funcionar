@@ -464,6 +464,8 @@ enum MaskData {
 pub(super) const LANE_MASK: Why = "a lane mask read as data";
 pub(super) const DIVERGENT_MASK_EXCHANGE: Why = "a lane mask exchanged where not every lane runs";
 pub(super) const GROUP_BARRIER_DIVERGENT: Why = "a group barrier where not every lane runs";
+/// A per-wave meet asked for in a block other than the one being lowered ([`Lower::order_waves`]).
+pub(super) const HALF_MEET_CLOSED: Why = "a half-meet in a block already closed";
 /// A mask with lanes outside EXEC where it is written, read as a number where the lanes that
 /// run that block are not all of the wave.
 pub(super) const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read as data";
@@ -4658,6 +4660,16 @@ impl<'a> Lower<'a> {
             if self.meet_refuse.is_none() {
                 need(self.cur_ir);
                 self.meet_refuse = Some("a half-meet where not every lane runs");
+            }
+            block
+        } else if block != self.cur {
+            // A meet ends `block` and goes on in a block of its own: only the block
+            // being lowered can be ended so. Another one (where a lane mask read later
+            // was written, `mask_dword` and `scc_some`) is closed already, and its end
+            // went to the meet's first block: what came after it was left out of the
+            // program (issue #30, "use of a void value" in the writer).
+            if self.meet_refuse.is_none() {
+                self.meet_refuse = Some(HALF_MEET_CLOSED);
             }
             block
         } else {
@@ -13739,6 +13751,77 @@ mod tests {
                     "unexpected refusal: {what}"
                 );
             }
+        }
+    }
+
+    /// A lane mask written where every lane runs and read as a number inside a region only
+    /// some waves of the group run: its ballot is taken in the block that wrote it, which is
+    /// closed by then, and the halves would meet there. That is refused (issue #30: the meet
+    /// took that block's end, and the writer later found a use of a value never emitted).
+    #[test]
+    fn half_meet_in_a_closed_block_is_refused() {
+        let words = [
+            0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+            0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+            0xBF88_0003, // s_cbranch_execz past the read of the mask
+            0x7E02_026A, // v_mov_b32 v1, vcc_lo
+            0x36 << 26 | 0x0D << 18, // ds_write_b32
+            1 << 8 | 1,
+            0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 16,
+            layout: vec![RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 15 | 2 << 1,
+                threads: [128, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, true, 16).unwrap();
+        let branch = p
+            .blocks
+            .iter()
+            .position(|b| b.insts.iter().any(|i| i.name() == "s_cbranch_execz"))
+            .unwrap();
+        let mut wide = std::collections::HashSet::new();
+        wide.insert(branch);
+        let st = structure::structure_wide(&p, &wide).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let was = super::TEST_HOST_WAVE.replace(Some(32));
+        let lowered = super::with_half_meets(|| {
+            lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            })
+        });
+        super::TEST_HOST_WAVE.set(was);
+        // (On b2184b1 this lowered: while IR block 1 was lowered, the meet went into the
+        // tail of the block that wrote the mask, and took that tail's end.)
+        match lowered {
+            Ok(_) => panic!("lowered with a meet in a block already closed"),
+            Err(crate::ShaderError::Unsupported { what, .. }) => assert_eq!(what, super::HALF_MEET_CLOSED),
+            Err(e) => panic!("unexpected {e}"),
         }
     }
 

@@ -124,6 +124,13 @@ pub fn frame_phase() -> u32 {
     copystat::phase()
 }
 
+/// How long ago the first frame of the world was presented (`VICTORY_CAPTURE_WORLD`),
+/// for `VICTORY_KEYS` entries counted from it.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub fn world_elapsed() -> Option<std::time::Duration> {
+    capture::world_elapsed()
+}
+
 /// Frames the title has begun (its frame waits that ended), for logs.
 pub fn frames_begun() -> u64 {
     frame::current()

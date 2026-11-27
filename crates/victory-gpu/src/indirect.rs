@@ -279,22 +279,64 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
 /// its last 1,905 tiles, the lowest of the picture. The console runs what it
 /// is asked (its dispatch counts are 32 bits), and so does an AMD card, whose
 /// dispatch packets and group numbers are the same; D3D12 does not look at
-/// indirect counts. Other cards stay at 65,535.
-fn widest(amd: bool) -> u32 {
-    let on = std::env::var_os("VICTORY_INDIRECT_WIDE").is_none_or(|v| v != "0");
-    if amd && on { 1 << 20 } else { 65_535 }
+/// indirect counts. So does an NVIDIA card (measured, [`wide_card`]).
+/// Other cards stay at 65,535.
+///
+/// `wide` is whether the card runs them by default ([`wide_card`]).
+/// `VICTORY_INDIRECT_WIDE=1` makes every card wide, `=0` none; unset (or
+/// anything else) the card's default holds.
+fn widest(wide: bool) -> u32 {
+    match std::env::var("VICTORY_INDIRECT_WIDE").as_deref() {
+        Ok("1") => 1 << 20,
+        Ok("0") => 65_535,
+        _ if wide => 1 << 20,
+        _ => 65_535,
+    }
 }
 
-/// Whether `device` is an AMD card's.
-pub(crate) fn amd(device: &ID3D12Device) -> bool {
+/// Whether `device`'s card runs indirect dispatches wider than 65,535
+/// groups by default ([`widest`]).
+///
+/// NVIDIA's do too: on an RTX 4070 the test
+/// `card_runs_wide_indirect_dispatches` saw every group of 67,440,
+/// 115,200 and 2^20 run once under its own number, clamped one by one and
+/// in a batch, as on AMD.
+fn wide_card(device: &ID3D12Device) -> bool {
+    amd(device) || nvidia(device)
+}
+
+/// The PCI vendor of `device`'s adapter (0: not found), looked up through
+/// DXGI once per adapter and kept: callers ask on hot paths (the clamp, the
+/// host), and a test process may hold devices of more than one adapter
+/// (WARP and the card), so the answer is kept by adapter, not once.
+fn vendor(device: &ID3D12Device) -> u32 {
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4};
-    // SAFETY: plain queries.
-    unsafe {
-        CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
-            .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid()))
-            .and_then(|a| a.GetDesc1())
-            .is_ok_and(|d| d.VendorId == 0x1002)
+    static KNOWN: std::sync::Mutex<Vec<((u32, i32), u32)>> = std::sync::Mutex::new(Vec::new());
+    // SAFETY: a plain query of a live device.
+    let luid = unsafe { device.GetAdapterLuid() };
+    let key = (luid.LowPart, luid.HighPart);
+    if let Some(&(_, v)) = KNOWN.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(k, _)| *k == key) {
+        return v;
     }
+    // SAFETY: plain queries.
+    let v = unsafe {
+        CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(luid))
+            .and_then(|a| a.GetDesc1())
+            .map_or(0, |d| d.VendorId)
+    };
+    KNOWN.lock().unwrap_or_else(|e| e.into_inner()).push((key, v));
+    v
+}
+
+/// Whether `device` is an AMD card's (PCI vendor 0x1002).
+pub(crate) fn amd(device: &ID3D12Device) -> bool {
+    vendor(device) == 0x1002
+}
+
+/// Whether `device` is an NVIDIA card's (PCI vendor 0x10DE).
+pub(crate) fn nvidia(device: &ID3D12Device) -> bool {
+    vendor(device) == 0x10de
 }
 
 /// Whether a record that does not fit in what is left of its list's budget
@@ -310,7 +352,7 @@ fn rest() -> u32 {
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
     let batched = source == batch::SOURCE;
     let root = root_signature(device, batched)?;
-    let source = &format!("#define WIDEST {}u\n#define REST {}\n{source}", widest(amd(device)), rest());
+    let source = &format!("#define WIDEST {}u\n#define REST {}\n{source}", widest(wide_card(device)), rest());
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
@@ -3031,9 +3073,10 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         sig.unwrap()
     }
 
-    /// An AMD card runs every group of an indirect dispatch of more than
-    /// 65,535, each under its own number: the title's tile lists
-    /// ([`widest`]), clamped one by one and in a batch. Others are not asked.
+    /// An AMD or NVIDIA card runs every group of an indirect dispatch of
+    /// more than 65,535, each under its own number: the title's tile lists
+    /// ([`widest`]), clamped one by one and in a batch. Others are asked only
+    /// with `VICTORY_INDIRECT_WIDE=1`; with `=0` none is.
     #[test]
     fn card_runs_wide_indirect_dispatches() {
         const CS: &str = r#"
@@ -3052,7 +3095,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
         let Some(mut gpu) = WarpHarness::on(false) else {
             return;
         };
-        if !amd(&gpu.device) || widest(true) == 65_535 {
+        if widest(wide_card(&gpu.device)) == 65_535 {
             return;
         }
         let worker = compile_cs(&gpu.device, CS).expect("the worker must compile");
@@ -3097,6 +3140,26 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
                 let wrong = (0..runs as usize).find(|&g| word(4 + g) != 1);
                 assert_eq!((wrong, word(4 + runs as usize)), (None, 0), "every group once, asked for {asked}");
             }
+        }
+    }
+
+    /// The vendor of a device is its adapter's, kept per adapter: WARP is
+    /// neither AMD's nor NVIDIA's however often it is asked, and the card
+    /// beside it in the same process keeps its own answer.
+    #[test]
+    fn vendors_are_kept_per_adapter() {
+        let Some(warp) = WarpHarness::new() else {
+            return;
+        };
+        for _ in 0..2 {
+            assert_eq!(vendor(&warp.device), 0x1414, "WARP is Microsoft's");
+            assert!(!amd(&warp.device) && !nvidia(&warp.device));
+        }
+        drop(warp);
+        if let Some(card) = WarpHarness::on(false) {
+            let v = vendor(&card.device);
+            assert_ne!(v, 0x1414);
+            assert_eq!((amd(&card.device), nvidia(&card.device)), (v == 0x1002, v == 0x10de));
         }
     }
 
