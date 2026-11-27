@@ -27,14 +27,16 @@ Os defeitos vistos jogando estão numerados em `relatos.md`; aqui ficam as causa
 | 8-12 FPS | O processador limita: preparo 51-57 ms por quadro | Passos 3 e 4 do `handoff.md` | #10, #13 |
 | 24-25 GB de RAM | Conjunto de trabalho grande; vazamento de 30-50 MB por minuto em "our own allocations" e "distinct views kept", medido só numa sessão longa do build antigo | Três chaves do `handoff.md`; linha de log com a memória do jogo; contadores por tipo | #2, #3 |
 | Sem perfil do processador | O `wpr` da máquina grava e falha ao salvar (0x80010106) | Instalar o Windows Performance Toolkit ou outro caminho | |
-| Cache frio | Mudar chave do tradutor esfria tudo | Pré-aquecimento por cache separado | #15 |
+| Cache frio | Mudar chave do tradutor esfria tudo. Com os pipelines frios a rota nvidia cai no primeiro quadro do mundo (R16) | `victory shaders` e `warm --used` antes de abrir; achar o dispatch que o jogo lê de volta | #15, #53 |
 
-| Quarentena do reaproveitamento (#32) | Hipótese de revisão, não confirmada: um buffer solto volta à reserva quando a submissão que o marcou termina, enquanto `retire_resource` espera mais submissões (`bury_lag`). Se uma submissão na fila ainda ler o buffer, ele pode ser zerado antes | Ler se a lista não enviada segura o `Arc`; `VICTORY_VIEW_BYTES_REUSE=0` na cena dos relatos R03 e R04 | |
+| Quarentena do reaproveitamento (#32) | Hipótese de revisão, não confirmada: um buffer solto volta à reserva quando a submissão que o marcou termina, enquanto `retire_resource` espera mais submissões (`bury_lag`). Se uma submissão na fila ainda ler o buffer, ele pode ser zerado antes | Ler se a lista não enviada segura o `Arc`; `VICTORY_VIEW_BYTES_REUSE=0` na cena dos relatos R03 e R04. A leitura do código não confirma a hipótese pelo caminho das listas | #41 |
+
+| Ports do upstream ainda não trazidos | 26 commits revisados; os de maior valor: tirar o par de volumetria da água da forma wide, a luz do ar no modo constante, a lista que cresce sem limite (memória) | Seguir a ordem da issue; não usar "Sync fork" | #43 |
 
 ## Processo
 | Lacuna | Próximo passo | Issue |
 |---|---|---|
-| Medidor e comparadores de imagem fora do repositório | Trazidos para `scripts/measure/` (PR do medidor). Falta uma rodada nova por eles, pelo `play.ps1`, para provar a cadeia inteira | |
+| Medidor e comparadores de imagem fora do repositório | Trazidos para `scripts/measure/` (PR do medidor). Falta uma rodada nova por eles, pelo `play.ps1`, para provar a cadeia inteira | #44 |
 | Series X nunca medido na máquina de 32 GB | Uma rodada vigiada; os consertos do mgrein só valem lá | |
 | Testes de GPU intermitentes | Retomar `fix/26-gpu-test-isolation`. O teste de GPU novo do reaproveitamento em `shadow.rs` pede `--test-threads=1` e não tem `#[ignore]` | #26 |
-| Limpezas apontadas na revisão do PR #34 | Três `agility.rs` quase iguais; testes repetidos no `play.ps1`; números de vendor soltos em `indirect.rs`; `xtask/src/agility.rs` cita uma issue de outro repositório; dispatch largo ligado por vendor com base numa única RTX 4070 | |
+| Limpezas apontadas na revisão do PR #34 | Três `agility.rs` quase iguais; testes repetidos no `play.ps1`; números de vendor soltos em `indirect.rs`; `xtask/src/agility.rs` cita uma issue de outro repositório; dispatch largo ligado por vendor com base numa única RTX 4070 | #42 |
