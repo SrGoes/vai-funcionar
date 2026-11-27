@@ -499,6 +499,42 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    let exact = emit_forms(c, native, p, st, io, res);
+    // A branch on a mask operation's SCC is the wave's ([`structure::Structured::wave_scc`],
+    // #66) and needs every lane where it stands. A program none of whose forms gives it that
+    // is taken with those branches split per lane, as before #66: inexact where an arm runs
+    // lanes whose own bit went the other way, but drawn. Dropped, its dispatch leaves what
+    // it writes unwritten, and the title read that back as a pointer: a write to 0 at
+    // +0x23cf683 loading the boat cutscene (#80) right after `ff6fdf23ce0b9048` failed so.
+    // `VICTORY_LANE_SPLIT=exact` refuses such a program instead.
+    let refused_wide = matches!(&exact,
+        Err(ShaderError::Unsupported { what, .. }) if *what == lower::WAVE_WIDE_ELSEWHERE);
+    if !refused_wide || st.wave_scc.is_empty() || std::env::var_os("VICTORY_LANE_SPLIT").is_some_and(|v| v == "exact") {
+        return exact;
+    }
+    let again = structure::with_per_lane(|| {
+        let st = structure::structure(p)?;
+        let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
+        emit_forms(c, native, p, &st, io, &res)
+    });
+    if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+        match &again {
+            Ok(_) => eprintln!("WAVE64-RETRY branches on a mask's SCC split per lane (inexact): translated"),
+            Err(e) => eprintln!("WAVE64-RETRY branches on a mask's SCC split per lane: {e}"),
+        }
+    }
+    // the exact form's refusal says more than the inexact one's
+    if again.is_err() { exact } else { again }
+}
+
+fn emit_forms(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
     let original = emit_program(c, native, p, st, io, res);
@@ -639,6 +675,18 @@ pub fn emit(
                     // CS_CollisionRaytraced
                     | [0xd3, 0x2c, 0xbc, 0xbf, 0xff, 0x6a, 0x0c, 0x04, 0x80, 0xb5, 0x06, 0xd8, 0xf7, 0xd6, 0x58, 0xf9]
             );
+        // `VICTORY_WATER_NOT_WIDE=1` (coolfox 963f719, #50): the two transmission volumetrics
+        // programs leave the forced wide form (the rectangles on the water). Off by default so
+        // both can be measured.
+        let water_not_wide = std::env::var_os("VICTORY_WATER_NOT_WIDE").is_some_and(|v| v == "1")
+            && matches!(
+                c.digest,
+                // CS_TransmissionVolumetrics_Tiled
+                [0x24, 0x12, 0x6c, 0x14, 0xdc, 0x76, 0x19, 0xb0, 0x82, 0xef, 0x57, 0x12, 0x96, 0x03, 0x88, 0x90]
+                    // CS_TransmissionVolumetrics_Tiled_LocalLights
+                    | [0x70, 0x99, 0xa5, 0x7f, 0xde, 0xd1, 0x42, 0x61, 0x3b, 0x44, 0xf4, 0x10, 0x46, 0x3d, 0x6b, 0xe6]
+            );
+        let scene_kernel = scene_kernel && !water_not_wide;
         let wide_on = wide_option
             .as_ref()
             .map_or_else(|| scene_kernel || WIDE_HERE.get(), |v| v == "1");
