@@ -609,18 +609,33 @@ fn whole_uav(shader: &HostShader, constants: [u32; 2], dwords: u32) -> Option<Ve
             ud[u.index as usize] = constants[d as usize];
         }
     }
+    // A program whose console waves meet on their own (`lower::with_half_meets`) counts its
+    // meetings, waits and wait atomics in the root UAV u<SLOT_MEET>: bound here (after
+    // DoubleGhosty/cool_fox PR #53), else the card reads an unbound root view and the device
+    // is removed.
+    let meets = shader.root_uavs.contains(&super::SLOT_MEET);
+    let mut roots = vec![(0, Root::Constants(ud))];
+    if meets {
+        assert_eq!(shader.root_uavs, [super::SLOT_MEET]);
+        assert!(shader.root_cbvs.is_empty() && shader.root_srvs.is_empty());
+        roots.push((1, Root::Uav(1)));
+    }
+    let with_meets = [View::RawUav(dwords), View::RawUav(3)];
     let out = host
         .dispatch(
             &root,
             &pso,
             &Dispatch {
-                roots: vec![(0, Root::Constants(ud))],
-                views: &[View::RawUav(dwords)],
+                roots,
+                views: if meets { &with_meets[..] } else { &with_meets[..1] },
                 samplers: &[],
                 groups: [1, 1, 1],
             },
         )
         .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+    if meets {
+        eprintln!("meetings, waits and wait atomics: {:?}", out[1]);
+    }
     Some(out[0].clone())
 }
 
