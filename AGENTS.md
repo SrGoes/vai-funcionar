@@ -12,6 +12,9 @@ Regras do norte:
 Os termos (jogável, defeito que bloqueia ou degrada, chave, rodada, matriz) estão definidos em `GLOSSARY.md`.
 
 ## Como rodar e medir
+- **Builds:** desenvolvimento e medição usam o diag: `cargo build --locked --profile diag -p victory --features diagnostics` → `target\diag\victory.exe` (o padrão do `scripts\play.ps1`; tem os logs debug/trace, a captura de quadro e as linhas `dropped`). Jogar usa o release: `cargo build --release --locked -p victory` → `target\release\victory.exe`, que é o que `Play-VIctory.cmd` abre.
+- **Dump:** fica fora do repositório e é passado por `VICTORY_GAME_DIR`, que o usuário define. Se não estiver definida, pergunte o caminho ao usuário; não procure nem copie o dump. `victory.toml` é ignorado pelo git (modelo em `victory.example.toml`). Cache dos shaders traduzidos: `%LOCALAPPDATA%\victory\cache`; saves: `%LOCALAPPDATA%\victory\data`.
+- **Logs:** só vão para o console. Para guardar, rode com `2>&1 | Tee-Object <arquivo>` fora do repositório e com o nível desejado: `RUST_LOG` na janela, ou `-Vars "VICTORY_LOG=info"` no `play.ps1` e nos `.cmd` (o `play.ps1` apaga as `VICTORY_*` definidas na janela).
 - **Rota por placa:** use o kit de chaves da sua placa. GeForce: `Play-VIctory.cmd` (duplo clique; `Play-VIctory.cmd series-s` ou `series-x` para escolher o perfil de console, senão ele é escolhido pela memória do PC) ou `scripts\play.ps1 -Route nvidia`; placa de 4 GB: `Play-VIctory-4GB.cmd` ou `-Route nvidia -LowMemory`. Radeon: `scripts\play.ps1 -Route amd` (o padrão do script). Os dois kits dão imagem e FPS diferentes; um número medido numa rota não vale para a outra.
 - **Windows 10:** rode `cargo xtask agility` uma vez antes do build. Sem o Agility SDK, o D3D12 do sistema recusa a root signature de todo pipeline traduzido e o port cai no primeiro quadro (`0xc0000005`, leitura em `0x68`).
 - **Pré-aquecimento:** `target\diag\victory.exe shaders <arquivos .rpf>` e depois `target\diag\victory.exe warm --used`, antes de medir. Os shaders traduzidos ficam guardados sob uma identificação que inclui as chaves que o tradutor lê (por exemplo `VICTORY_WAVE_WIDE`): mudar uma delas invalida o que foi traduzido e pede novo pré-aquecimento.
@@ -20,6 +23,32 @@ Os termos (jogável, defeito que bloqueia ou degrada, chave, rodada, matriz) est
 - **Medir:** sempre pela rota da placa, no build de diagnóstico, no mesmo ponto fixo do save (ninguém toca no jogo), com cache aquecido, três rodadas ou mais por configuração em ordem alternada. Compare só números da mesma cena; uma rodada isolada com a câmera em outro lugar não é resultado.
 
 Use exclusivamente código, documentação, recursos e interfaces cujo uso seja autorizado. Não remova DRM, não contorne proteções, não obtenha chaves ou código proprietário não autorizado. Caso faltem componentes essenciais, registre o impedimento e use testes sintéticos autorizados para validar módulos independentes; não os apresente como execução do jogo.
+
+## Agent skills
+
+### Issue tracker
+
+As tarefas e defeitos ficam no [GitHub Issues de `SrGoes/vai-funcionar`](https://github.com/SrGoes/vai-funcionar/issues) (CLI `gh`). Veja `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Os cinco rótulos padrão, com o mesmo nome: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. Veja `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Contexto único: `GLOSSARY.md` na raiz e `docs/adr/` (criado quando houver a primeira decisão). Veja `docs/agents/domain.md`.
+
+### Passagem de bastão
+
+Antes de começar, leia `docs/agents/README.md`: estado (`handoff.md`), lacunas (`gaps.md`), forks já lidos (`references.md`) e achados datados (`findings/`). Ao terminar, atualize `handoff.md` e `gaps.md` no mesmo PR.
+
+### Máquinas
+
+Todo número medido vale para a máquina em que foi medido. Antes de usar ou comparar um, confira placa, RAM e sistema em `docs/agents/machines.md`. Caminhos locais (ferramentas, dump) ficam no `CLAUDE.local.md` de cada máquina, fora do git.
+
+### Ferramentas de arquivos do jogo
+
+Para inspecionar ou extrair RPF9, texturas, áudio, vídeo ou shaders da própria cópia, leia antes `docs/agents/vi-tools.md`: quais ferramentas existem e as regras para compilá-las e usá-las.
 
 ## A. Protocolo de execução: medir, alterar, provar
 1. Examine árvore de arquivos, histórico Git, build system, dependências, implementação de runtime, tradução de código e shaders, APIs gráficas, streaming, áudio, entrada e serviços. Identifique o caminho real de inicialização até a apresentação de um quadro.
