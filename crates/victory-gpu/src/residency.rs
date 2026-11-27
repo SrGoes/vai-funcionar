@@ -1,6 +1,6 @@
 ﻿//! Host-memory admission for speculative texture work and reusable upload storage.
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
 const MIB: u64 = 1 << 20;
@@ -19,6 +19,69 @@ fn memory_status() -> Option<MEMORYSTATUSEX> {
 static NEXT_COMMIT_SAMPLE: AtomicU64 = AtomicU64::new(0);
 static AVAILABLE_COMMIT: AtomicU64 = AtomicU64::new(u64::MAX);
 static RETRY_UPLOAD_AT: AtomicU64 = AtomicU64::new(0);
+
+/// The PC's memory shared with the card, as DXGI counts it for this
+/// process: how full against its budget ([`shared_level`]), sampled at most
+/// every 32 ms. Commit and free RAM alone do not see it: on a 16 GB PC with
+/// a 40 GB page file (RTX 5060, 27/11) commit stayed above 30 GB free while
+/// the shared group went past its 7.4 GB budget (staging blocks for the
+/// textures of a loading world, 5 GB of them), upload buffers failed with
+/// E_OUTOFMEMORY 641 times and the driver crashed closing a list
+/// (`nvwgf2umx.dll+0x422e03`, twice). `VICTORY_SHARED_GUARD=0`: not looked at.
+static NEXT_SHARED_SAMPLE: AtomicU64 = AtomicU64::new(0);
+static SHARED_LEVEL: AtomicU8 = AtomicU8::new(0);
+
+/// How full the shared group is: 0 below 85 % of its budget; 1 (pressure:
+/// idle storage let go, prefetch held to 64 MB a frame) from 85 %; 2 (no new
+/// staging blocks for speculative textures) from 90 %; 3 (critical: no spare
+/// staging blocks kept, prefetch held to 16 MB) from 95 %; 4 (only the
+/// textures a draw needs now) from 97 %. A budget of 0 counts as no budget.
+fn shared_level(budget: u64, used: u64) -> u8 {
+    if budget == 0 {
+        return 0;
+    }
+    let percent = u128::from(used) * 100 / u128::from(budget);
+    match percent {
+        0..85 => 0,
+        85..90 => 1,
+        90..95 => 2,
+        95..97 => 3,
+        _ => 4,
+    }
+}
+
+fn shared_guard() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SHARED_GUARD").is_none_or(|v| v != "0"))
+}
+
+/// [`SHARED_LEVEL`], sampled again if 32 ms have passed.
+fn sample_shared(now: u64) -> u8 {
+    if !shared_guard() {
+        return 0;
+    }
+    let next = NEXT_SHARED_SAMPLE.load(Ordering::Relaxed);
+    if now >= next
+        && NEXT_SHARED_SAMPLE
+            .compare_exchange(next, now.saturating_add(32), Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        && let Some([_, [budget, used, ..]]) = crate::host::host().and_then(|h| h.video_memory_groups())
+    {
+        let level = shared_level(budget, used);
+        let was = SHARED_LEVEL.swap(level, Ordering::Relaxed);
+        if level != was && (level >= 3 || was >= 3) {
+            tracing::warn!(
+                level,
+                was,
+                budget_mib = budget >> 20,
+                used_mib = used >> 20,
+                texture_staging_mib = crate::texture::live_staging_bytes() >> 20,
+                "the PC's memory shared with the card: level changed (3 and up hold texture uploads back)"
+            );
+        }
+    }
+    SHARED_LEVEL.load(Ordering::Relaxed)
+}
 
 pub(crate) fn allocation_error(error: &windows::core::Error) {
     if error.code() == windows::Win32::Foundation::E_OUTOFMEMORY {
@@ -76,6 +139,9 @@ pub(crate) fn admit_texture_pass(bake: bool) -> bool {
     if now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) {
         return false;
     }
+    if !bake && sample_shared(now) >= 4 {
+        return false;
+    }
     has_upload_reserve(sample_commit(now), bake)
 }
 
@@ -85,6 +151,9 @@ pub(crate) fn admit_texture_pass(bake: bool) -> bool {
 pub(crate) fn allow_staging_growth(bake: bool) -> bool {
     let now = crate::host::coarse_ms();
     if now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) {
+        return false;
+    }
+    if sample_shared(now) >= if bake { 4 } else { 2 } {
         return false;
     }
     has_growth_reserve(sample_commit(now), bake)
@@ -135,15 +204,18 @@ pub(crate) fn headroom() -> Option<u64> {
     (bytes != u64::MAX).then_some(bytes)
 }
 
+/// Free RAM or commit low ([`refresh`]), or the shared group at 85 % of its
+/// budget ([`shared_level`]).
 pub(crate) fn pressured() -> bool {
-    PRESSURED.load(Ordering::Relaxed)
+    PRESSURED.load(Ordering::Relaxed) || sample_shared(crate::host::coarse_ms()) >= 1
 }
 
-/// True when OS commit headroom is critically low (< 1.5 GiB) or an allocation
-/// just failed with `E_OUTOFMEMORY`, requiring emergency throttling.
+/// True when OS commit headroom is critically low (< 1.5 GiB), the shared
+/// group is at 95 % of its budget, or an allocation just failed with
+/// `E_OUTOFMEMORY`, requiring emergency throttling.
 pub(crate) fn critical_commit() -> bool {
     let now = crate::host::coarse_ms();
-    now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) || sample_commit(now) < 1536 * MIB
+    now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) || sample_commit(now) < 1536 * MIB || sample_shared(now) >= 3
 }
 
 /// A soft per-frame admission limit. A single texture can cross it. The
@@ -175,6 +247,18 @@ mod tests {
             assert_eq!(has_upload_reserve(commit, false), lookahead);
             assert_eq!(has_growth_reserve(commit, false), growth);
         }
+    }
+
+    #[test]
+    fn the_shared_group_is_held_back_before_its_budget() {
+        let budget = 7446 * MIB;
+        assert_eq!(shared_level(0, 9 * GIB), 0);
+        assert_eq!(shared_level(budget, 5955 * MIB), 0);
+        assert_eq!(shared_level(budget, budget * 85 / 100 + MIB), 1);
+        assert_eq!(shared_level(budget, budget * 91 / 100), 2);
+        assert_eq!(shared_level(budget, budget * 96 / 100), 3);
+        // Run look720u6 (27/11): 7,694 MB in use of 7,446 when uploads failed.
+        assert_eq!(shared_level(budget, 7694 * MIB), 4);
     }
 
     #[test]

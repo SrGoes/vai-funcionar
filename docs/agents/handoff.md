@@ -11,6 +11,23 @@ A `main` recebeu, depois do que está descrito abaixo, os PRs #46 a #50, #52 e #
 - **Teste de abertura na máquina A, pela pasta principal na `main`:** `Play-VIctory.cmd` chegou ao mundo em 40 s e rodou a 13-15 FPS com ~4.200 draws por quadro (release, Series S pelo automático, cache aquecido). No build de diagnóstico a memória privada chegou a 27,6 GB, com menos de 1 GB de RAM livre.
 - **Onde está o trabalho que falta:** #36 a #40 (relatos do playtest), #41 (hipótese no reaproveitamento; a leitura do código não a confirma), #42 (limpezas), #43 (26 commits do upstream revisados, por ordem de valor; não usar "Sync fork"), #44 (primeira rodada do medidor pelo `play.ps1`), #45 (cabelo por padrão), #53 (queda com cache frio). O desenho da tradução do #30 e a classificação das recusas em grupos de 64 estão em `findings/2026-11-27-desenho-da-traducao-30-e-recusas-de-grupos-de-64.md`.
 
+## Máquina B (16 GB de RAM), 27/11 à tarde: o que a fez chegar ao mundo aberto
+Branch `fix/shared-budget-guard`. Rota nvidia, build de diagnóstico da `main` em `5487f38` mais o freio, Series S, cache aquecido (`victory shaders`, uma rodada com `VICTORY_PIPELINE_BOOK=1`, depois `warm --used`: 2.006 pipelines).
+
+- **A queda da máquina B não era o cabelo nem o #53:** era a memória do PC compartilhada com a placa. O Windows dá à placa metade da RAM (7.446 MB nesta máquina). As janelas de memória do jogo (~5 GB) mais o staging das texturas de um mundo carregando passaram disso. Os buffers de upload falharam com `E_OUTOFMEMORY` (641 vezes numa rodada), e o driver caiu ao fechar uma lista em `Host::submit` (`nvwgf2umx.dll+0x422e03`, leitura em `0x36`). Isso aconteceu três vezes, entre 7 e 11 minutos. O commit e a RAM livre, que são o que os freios de `residency.rs` olhavam, não viam o problema: com pagefile de 40 GB, sobravam 30 GB de commit.
+- **Freio novo (`residency.rs`):** o nível de uso do grupo compartilhado do DXGI entra nos freios que já existiam. A partir de 85% é pressão; de 90%, o staging especulativo para de crescer; de 95%, é crítico; de 97%, só sobem as texturas que o draw precisa. `VICTORY_SHARED_GUARD=0` desliga. Sozinho, só atrasou a queda (de 7 para 11 min), porque as janelas continuavam crescendo.
+- **O que fez passar:** a chave nova `-SmallRam` do `play.ps1`, com o atalho `Play-VIctory-16GB.cmd`:
+  - saída em 1280x720 com o upscaler do próprio jogo (`VICTORY_OUTPUT`, `VICTORY_UPSCALER=6`). O FidelityFX da Series S divide por zero abaixo de 1080p, em `+0x28f03e8`, e foi visto uma vez;
+  - `VICTORY_TEXTURE_MAX=1024`;
+  - `VICTORY_WINDOWS_BAR_MB=1536`;
+  - cabelo ligado;
+  - defrag do #46 de fora.
+
+  Com isso a rodada passou pela cutscene da prisão e chegou à perseguição de barco do mundo aberto, a 7-10 FPS, com a memória compartilhada em 5,6-5,8 GB. Rodou mais de 20 minutos sem cair, apesar de 296 falhas de upload no pico de carregamento.
+- **Imagem dessa rodada:** cabelo presente (Lucia e NPCs), personagens com textura, água e céu bons. Nas rodadas anteriores, o preto do cenário vinha de uma fila de 13 a 25 mil texturas esperando subir (`VICTORY_TEXTURE_NO_WAIT=1`). Com o teto de 1024, a fila caiu para 6-8 mil no mundo. Os interiores continuam escuros e chapados por causa da luz substituta (`constant:0.8`), já que o ray tracing está fora. O ruído colorido num cartaz continuou mesmo com o defrag fora.
+- **Nada disso é padrão do kit nvidia:** é a chave `-SmallRam`. Mudar o padrão fica para o Bruno, com as imagens.
+- **Não medido:** FPS em ponto fixo com 3 rodadas. Os números acima são de uma rodada por configuração, em cenas que andam sozinhas. As janelas finas (`VICTORY_WINDOW_KB=256` com `VICTORY_WINDOW_TAILS=1`) não reduziram as janelas (4,95 GB em 8.653 janelas) e o FPS pareceu menor, por isso ficaram de fora. O kit da madrugada (PR #56) não mostrou ganho aqui numa rodada (6,13 FPS na base, 5,76 com o kit); `VICTORY_REAPER=0` deu 4,79.
+
 ## Em uma frase
 O port abre e chega ao mundo em placa NVIDIA no Windows 10, a 8-12 FPS e sem o roxo, mas está abaixo dos dois pisos de "jogável": falta FPS, a água tem retângulos, a vegetação pisca ao andar e a iluminação do jogo não roda.
 
