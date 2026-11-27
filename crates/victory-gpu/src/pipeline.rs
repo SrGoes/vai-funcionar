@@ -582,7 +582,14 @@ pub(crate) fn note_drop(this: This) {
         let p = pipeline(this);
         skipped_shader(p)
             .map(|hash| format!("skipped shader {hash}"))
-            .or_else(|| make::missing(&p.host))
+            .or_else(|| {
+                let why = make::missing(&p.host)?;
+                // (not for pipelines still being made: they get one)
+                if why != "being made" {
+                    make::tell_dropped(&p.host, &why);
+                }
+                Some(why)
+            })
     };
     if let Some(why) = why {
         note_why(why);

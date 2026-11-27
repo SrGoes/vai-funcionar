@@ -213,6 +213,38 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
     }
 }
 
+/// Diagnostics: says once per set of shaders that a draw or dispatch of
+/// `p` was dropped for want of a host pipeline (`why`, [`missing`]), with
+/// the wave lanes each of its console programs was written for (64 needs a
+/// wave32 lowering on a host of 32-lane waves). Each drop is still counted
+/// by `crate::pipeline::note_why`.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn tell_dropped(p: &Pending, why: &str) {
+    static TOLD: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+    let key = hashes(p);
+    let new = TOLD.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(key.clone());
+    if !new {
+        return;
+    }
+    let lanes: Vec<String> = p
+        .shaders
+        .iter()
+        .map(|s| {
+            let waves = s.programs().map_or_else(
+                || "unknown".to_owned(),
+                |programs| programs.iter().map(|q| if q.wave64 { "64" } else { "32" }).collect::<Vec<_>>().join("/"),
+            );
+            format!("{} {}: wave {waves}", s.stage, s.hash)
+        })
+        .collect();
+    tracing::warn!(
+        shaders = %key,
+        why,
+        lanes = %lanes.join(", "),
+        "a draw or dispatch dropped without a host pipeline (said once for these shaders)"
+    );
+}
+
 /// The hashes of the shaders `p` is made of.
 pub(crate) fn hashes(p: &Pending) -> String {
     let hashes: Vec<&str> = p.shaders.iter().map(|s| s.hash.as_str()).collect();

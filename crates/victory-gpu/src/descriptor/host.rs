@@ -1242,6 +1242,52 @@ pub(crate) fn is_texture_view(view: &View) -> bool {
 /// ([`buffer_view_ok`]), since the start.
 pub(crate) static REFUSED_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Diagnostics, since the last frame line ([`null_views_line`]): constant
+/// buffers left null for not being 256-byte aligned on the host, and
+/// buffer views (shader resource, unordered access) left null for not
+/// beginning on an element of their host copy. The `once!` warnings say
+/// so only the first time of the run.
+#[cfg(feature = "diagnostics")]
+static NULL_VIEWS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Diagnostics: the first of each kind in [`NULL_VIEWS`] since the last
+/// frame line, as (address, bytes) of a constant buffer, or (offset in its
+/// copy, element bytes) of a buffer view.
+#[cfg(feature = "diagnostics")]
+static NULL_VIEW_FIRST: std::sync::Mutex<[Option<(u64, u64)>; 3]> = std::sync::Mutex::new([None; 3]);
+
+/// Diagnostics: counts one of [`NULL_VIEWS`] (`kind`: 0 a constant buffer,
+/// 1 a shader resource view, 2 an unordered access view).
+#[cfg(feature = "diagnostics")]
+fn count_null_view(kind: usize, at: u64, bytes: u64) {
+    if NULL_VIEWS[kind].fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+        NULL_VIEW_FIRST.lock().unwrap_or_else(|e| e.into_inner())[kind].get_or_insert((at, bytes));
+    }
+}
+
+/// Diagnostics, with the frame line: the views of [`NULL_VIEWS`] per frame
+/// over `frames`, and the first of each. Nothing while there are none.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn null_views_line(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let n = [0, 1, 2].map(|i| NULL_VIEWS[i].swap(0, Relaxed));
+    let first = std::mem::take(&mut *NULL_VIEW_FIRST.lock().unwrap_or_else(|e| e.into_inner()));
+    if n.iter().all(|&n| n == 0) {
+        return;
+    }
+    let first = first.map(|f| f.map_or_else(|| "-".to_owned(), |(at, bytes)| format!("{at:#x}/{bytes}")));
+    tracing::info!(
+        "views left null per frame: {:.1} constant buffers not 256-byte aligned on the host (first: address {}/bytes), \
+         {:.1} buffer views and {:.1} unordered buffer views not on an element of their host copy (first: offset {} and {}/element bytes)",
+        n[0] as f64 / frames,
+        first[0],
+        n[1] as f64 / frames,
+        n[2] as f64 / frames,
+        first[1],
+        first[2]
+    );
+}
+
 /// Whether the host device is gone, and why (the first time it is asked
 /// after that): for passes that make many views, to name the one that did
 /// it.
@@ -4202,6 +4248,8 @@ fn buffer_srv(
                 element,
                 "buffer view not on an element of its host copy"
             );
+            #[cfg(feature = "diagnostics")]
+            count_null_view(1, offset, element);
             return None;
         }
         buffer.FirstElement += offset / element;
@@ -4322,6 +4370,8 @@ fn buffer_uav(
     } else {
         if element == 0 || offset % element != 0 {
             once!(offset, element, "unordered buffer view not on an element of its host copy");
+            #[cfg(feature = "diagnostics")]
+            count_null_view(2, offset, element);
             return None;
         }
         buffer.FirstElement += offset / element;
@@ -4646,6 +4696,8 @@ fn make_twinned(
                     address = format_args!("{address:#x}"),
                     "constant buffer not 256-byte aligned on the host"
                 );
+                #[cfg(feature = "diagnostics")]
+                count_null_view(0, address, u64::from(size));
                 return None;
             }
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
