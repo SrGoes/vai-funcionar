@@ -10210,6 +10210,7 @@ impl Meter {
                     put[2] / 1e6,
                     put[3]
                 );
+                crate::descriptor::host::null_views_line(frames);
                 traffic::line(self.copy_stats_frames as f64);
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
                 for (why, n) in drops.iter().take(40) {
