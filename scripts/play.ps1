@@ -98,6 +98,10 @@ if ($Route -eq 'amd') {
         # Hair on by default: without it people are drawn bald (the hair programs are
         # among ~1,800 shaders skipped a frame). 27/11: no frame-rate cost seen.
         VICTORY_HAIR = '1'
+        # Pipelines with static samplers keep using the pipeline library: without this
+        # (the 7fa0e95 pick) they are compiled again at every start and the screen stays
+        # black for minutes. The pick's fix for banded light stays opt-in (=0).
+        VICTORY_LIBRARY_STATIC_SAMPLERS = '1'
     }
     if ($LowMemory) {
         # Play-VIctory-4GB.cmd: the estimate (not the constant), the guard at its
