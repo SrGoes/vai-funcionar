@@ -1296,12 +1296,97 @@ pub(crate) fn read_from(layout: &victory_formats::texture::Layout, first: u32) -
     if layout.bytes_from(first) < layout.size { first } else { 0 }
 }
 
+/// The share of the card's local VRAM budget in use, in percent (looked up
+/// at most every tenth of a second).
+#[cfg(windows)]
+fn video_memory_percent() -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tenth = crate::host::now_ms() / 100 + 1;
+    let last = LAST.load(Relaxed);
+    if last >> 8 == tenth {
+        return last & 0xff;
+    }
+    let pct = crate::host::host()
+        .and_then(|h| h.video_memory())
+        .and_then(|[budget, used, ..]| (budget > 0).then(|| ((u128::from(used) * 100) / u128::from(budget)).min(255) as u64))
+        .unwrap_or(0);
+    LAST.store((tenth << 8) | pct, Relaxed);
+    pct
+}
+
+/// The largest side a streamed placed 2D texture's host copy may have
+/// (`VICTORY_TEXTURE_MAX`): unset or `0` uncapped; `auto` 1024, then 512 from
+/// 92 % of the local VRAM budget and 256 from 97 %; a number, that side.
+/// Off by default: it trades texture detail for VRAM, upload bytes and
+/// shared memory, to be measured first.
+///
+/// Ported from Belobug/VIctory-Belobug-AMD e942896 (beloooo), after
+/// VIctory-vitesse 7ada43b6, where `auto` was the default.
+#[cfg(windows)]
+fn texture_max() -> Option<u64> {
+    #[derive(Clone, Copy)]
+    enum Cap {
+        Off,
+        Auto,
+        Side(u64),
+    }
+    static SET: std::sync::OnceLock<Cap> = std::sync::OnceLock::new();
+    let set = *SET.get_or_init(|| {
+        let cap = match std::env::var("VICTORY_TEXTURE_MAX").ok().map(|v| v.trim().to_ascii_lowercase()) {
+            None => Cap::Off,
+            Some(v) if v == "auto" => Cap::Auto,
+            Some(v) => match v.parse::<u64>() {
+                Ok(0) => Cap::Off,
+                Ok(side) => Cap::Side(side),
+                Err(_) => {
+                    tracing::warn!(value = %v, "VICTORY_TEXTURE_MAX: expected auto, 0 or a side in texels; uncapped");
+                    Cap::Off
+                }
+            },
+        };
+        match cap {
+            Cap::Off => {}
+            Cap::Auto => tracing::info!("texture sides capped by VRAM use: 1024, 512 from 92 %, 256 from 97 % (VICTORY_TEXTURE_MAX=auto)"),
+            Cap::Side(side) => tracing::info!(side, "texture sides capped (VICTORY_TEXTURE_MAX)"),
+        }
+        cap
+    });
+    match set {
+        Cap::Off => None,
+        Cap::Side(side) => Some(side),
+        Cap::Auto => Some(match video_memory_percent() {
+            0..92 => 1024,
+            92..97 => 512,
+            _ => 256,
+        }),
+    }
+}
+
+/// How many of a streamed placed 2D texture's largest levels its host copy
+/// leaves out so that no side passes [`texture_max`] (0: none).
+#[cfg(windows)]
+fn over_cap(desc: &ResourceDesc) -> u32 {
+    let Some(max) = texture_max() else {
+        return 0;
+    };
+    let mut skip = 0u32;
+    while (desc.width >> skip) > max || (u64::from(desc.height) >> skip) > max {
+        if skip + 1 >= u32::from(desc.mip_levels) {
+            break;
+        }
+        skip += 1;
+    }
+    skip
+}
+
 /// The level a host copy begins at for views that start at `first`: one the
-/// host can have as a texture's level 0 ([`read_from`]; block-compressed
-/// formats in whole blocks).
+/// host can have as a texture's level 0 ([`read_from`], [`over_cap`];
+/// block-compressed formats in whole blocks).
 #[cfg(windows)]
 fn base_level(desc: &ResourceDesc, first: u32) -> u32 {
     const TEXTURE_2D: u32 = 3;
+    let first = first.max(over_cap(desc));
     if first == 0
         || !fills(desc)
         || desc.dimension != TEXTURE_2D
@@ -1656,13 +1741,14 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         // The levels views show ([`held_only`]), those of the slots shaders
         // pick by index among them.
         let mut base = 0;
-        if shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
+        // (Not for a texture already made above, level by level: it has all
+        // of its levels.)
+        if texture.is_none() && shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
             let wanted = r.host.wanted.load(Relaxed);
             let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
             let first = wanted.min(viewed);
-            if first != u32::MAX {
-                base = base_level(&r.desc, first);
-            }
+            // (Nothing viewed yet: from level 0, or the first under the cap.)
+            base = base_level(&r.desc, if first == u32::MAX { 0 } else { first });
         }
         let texture = match texture {
             Some(texture) => Some(texture),
