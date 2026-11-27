@@ -4511,7 +4511,8 @@ pub(crate) mod awake;
 mod card_steps;
 #[cfg(any(feature = "diagnostics", test))]
 pub(crate) mod indirects;
-#[cfg(feature = "diagnostics")]
+mod font;
+mod menu;
 mod panel;
 mod place;
 mod send;
@@ -10544,9 +10545,15 @@ struct Presenter {
     hwnd: HWND,
     meter: Meter,
     composer: Option<crate::compose::Composer>,
-    #[cfg(feature = "diagnostics")]
+    /// The numbers panel (F3), in every build.
     panel: panel::Panel,
+    /// The F1 settings menu.
+    menu: menu::Menu,
 }
+
+/// The frame rate the meter last counted, in tenths of a frame a second (0: none yet): for the
+/// line at the top of the picture (`menu.rs`).
+pub(crate) static METER_FPS_TENTHS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// The frame rate, shown in the window's caption every second and logged
 /// every few seconds.
@@ -10578,7 +10585,6 @@ impl Meter {
     }
 
     /// Whether the next frame counted makes the frame-rate line.
-    #[cfg(feature = "diagnostics")]
     fn line_due(&self) -> bool {
         self.since.elapsed() >= std::time::Duration::from_secs(1)
     }
@@ -10616,6 +10622,7 @@ impl Meter {
         let frames = f64::from(self.frames);
         let fps = frames / elapsed.as_secs_f64();
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
+        METER_FPS_TENTHS.store((fps * 10.0).round() as u32, Ordering::Relaxed);
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
@@ -11166,8 +11173,8 @@ impl Host {
             } else {
                 crate::popwatch::take(&self.device, list, texture)
             };
-            #[cfg(feature = "diagnostics")]
             p.panel.draw(self, copy, &back, (width, height), format);
+            p.menu.draw(self, copy, &back, (width, height), format);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
             if composed {
@@ -11215,9 +11222,9 @@ impl Host {
             let mut showing = crate::timeline::span("the host's Present");
             let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
             showing.next("the frame meter");
-            #[cfg(feature = "diagnostics")]
             if status == windows::Win32::Foundation::S_OK {
                 p.panel.frame(p.meter.line_due());
+                p.menu.frame();
             }
             let presented = p.meter.record_present(p.hwnd, status);
             showing.end();
@@ -11273,8 +11280,8 @@ impl Host {
                 hwnd,
                 meter: Meter::new(),
                 composer: None,
-                #[cfg(feature = "diagnostics")]
                 panel: panel::Panel::new(),
+                menu: menu::Menu::new(),
             })
         }
     }
