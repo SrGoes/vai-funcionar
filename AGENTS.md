@@ -12,7 +12,7 @@ Regras do norte:
 Os termos (jogável, defeito que bloqueia ou degrada, chave, rodada, matriz) estão definidos em `GLOSSARY.md`.
 
 ## Como rodar e medir
-- **Rota por placa:** use o kit de chaves da sua placa. GeForce: `Play-VIctory.cmd` (duplo clique) ou `scripts\play.ps1 -Route nvidia`; placa de 4 GB: `Play-VIctory-4GB.cmd` ou `-Route nvidia -LowMemory`. Radeon: `scripts\play.ps1 -Route amd` (o padrão do script). Os dois kits dão imagem e FPS diferentes; um número medido numa rota não vale para a outra.
+- **Rota por placa:** use o kit de chaves da sua placa. GeForce: `Play-VIctory.cmd` (duplo clique; `Play-VIctory.cmd series-s` ou `series-x` para escolher o perfil de console, senão ele é escolhido pela memória do PC) ou `scripts\play.ps1 -Route nvidia`; placa de 4 GB: `Play-VIctory-4GB.cmd` ou `-Route nvidia -LowMemory`. Radeon: `scripts\play.ps1 -Route amd` (o padrão do script). Os dois kits dão imagem e FPS diferentes; um número medido numa rota não vale para a outra.
 - **Windows 10:** rode `cargo xtask agility` uma vez antes do build. Sem o Agility SDK, o D3D12 do sistema recusa a root signature de todo pipeline traduzido e o port cai no primeiro quadro (`0xc0000005`, leitura em `0x68`).
 - **Pré-aquecimento:** `target\diag\victory.exe shaders <arquivos .rpf>` e depois `target\diag\victory.exe warm --used`, antes de medir. Os shaders traduzidos ficam guardados sob uma identificação que inclui as chaves que o tradutor lê (por exemplo `VICTORY_WAVE_WIDE`): mudar uma delas invalida o que foi traduzido e pede novo pré-aquecimento.
 - **Conferir o kit:** `scripts\play.ps1 ... -DryRun` (ou `Play-VIctory.cmd -DryRun`) imprime todas as chaves e a linha de comando sem abrir o jogo; ao abrir, o script imprime o mesmo kit.

@@ -58,7 +58,7 @@ Use the kit of settings for your card. The two kits give different pictures and 
 
 | Card | Double-click | Same thing from PowerShell |
 |---|---|---|
-| NVIDIA GeForce | `Play-VIctory.cmd` | `scripts\play.ps1 -Exe <exe> -Route nvidia -Console series-x -Build release` |
+| NVIDIA GeForce | `Play-VIctory.cmd` (console by this PC's memory), or `Play-VIctory.cmd series-s` / `series-x` | `scripts\play.ps1 -Exe <exe> -Route nvidia -Console auto -Build release` |
 | 4 GB card or low-memory PC | `Play-VIctory-4GB.cmd` | `scripts\play.ps1 -Exe <exe> -Route nvidia -LowMemory -Console series-s -Build release` |
 | AMD Radeon | — | `scripts\play.ps1 -Exe <exe> -Route amd` (the default route) |
 

@@ -72,3 +72,5 @@ Origem: uma nota externa e a leitura direta do fork. Tudo abaixo marcado VERIFIC
 ## Correção 03:05: as duas causas da nota externa já estavam descartadas na nossa pesquisa
 - `2026-11-27-consertos-em-outros-ports.md` já dizia: recusa de tabelas no heap de 1.000.000 "descartado para a nossa cena (0 recusadas por quadro)" e corte em 65.535 "descartado para a nossa cena: maior pedido nosso 1.368". Portei mesmo assim por não reler os relatórios depois da compactação. Vale só para Series X.
 - Suspeita que sobra para retângulos na água E vegetação piscando: a lista de programas que liga `scene_kernel` (`emit/mod.rs:625-640`) que força a forma wide em seis programas (`CS_TransmissionVolumetrics_Tiled`, `_LocalLights`, `CS_Tree_BatchCull`, `_ImposterOnly`, `CS_Visibility`). Teste: `VICTORY_WAVE_WIDE=0`. Conserto de verdade: forma paired do fxceless (#854 parte paired + #1419).
+
+> **Atualização (PR #49):** o `Play-VIctory.cmd` não força mais Series X. Sem palavra ele escolhe o perfil de console pela memória do PC; `Play-VIctory.cmd series-x` pede Series X. O que este achado diz sobre "o perfil do `Play-VIctory.cmd`" vale para antes dessa mudança.

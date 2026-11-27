@@ -22,3 +22,4 @@ Comentários do próprio .cmd: constante porque a estimativa "lavava" o quadro a
 Sem textura roxa em persiana e luz; reflexo do sol na água; nuvens melhores; quadrados na água reduzidos mas presentes; FPS 8-10, "bem travado"; um braço e a escada de dentro ficaram pretos ao mover; um flash vermelho na tela; artefatos e falta de nitidez em vegetação, barba e pelo, piores ao mexer a câmera ("parece artefato de DLSS"); sombras bugando (metade direita escura).
 Suspeitas ainda não testadas: `VICTORY_UPLOAD_AHEAD=1` para o preto (saiu do play.ps1 por deixar decals pretas na NVIDIA, commit 8d50b6b); o reconstrutor temporal do jogo a 8-10 FPS para o borrão (o FSR4 do jogo não carrega, issue #12).
 
+> **Atualização (PR #49):** o `Play-VIctory.cmd` não força mais Series X. Sem palavra ele escolhe o perfil de console pela memória do PC; `Play-VIctory.cmd series-x` pede Series X. O que este achado diz sobre "o perfil do `Play-VIctory.cmd`" vale para antes dessa mudança.
