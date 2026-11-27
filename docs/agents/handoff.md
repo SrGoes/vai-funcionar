@@ -1,5 +1,16 @@
 # Passagem de bastão (estado em 27/11/2026)
 
+## Atualização do fim de 27/11 (ler primeiro)
+A `main` recebeu, depois do que está descrito abaixo, os PRs #46 a #50, #52 e #54. O que muda:
+
+- **Antes de abrir depois de atualizar: refaça o pré-aquecimento, os dois passos.** O #46 mexe no tradutor e muda a chave do cache de shaders. Rode `target\diag\victory.exe shaders <arquivos .rpf>` e depois `target\diag\victory.exe warm --used`, com o mesmo `VICTORY_CACHE_DIR` que o launcher usa (na rota nvidia, `%LOCALAPPDATA%\VIctory\cache-pareto`).
+- **Com o cache de pipelines frio a rota nvidia cai no primeiro quadro do mundo** (`0xc0000005`, escrita em 0, dentro do código do jogo): issue #53. Visto três vezes no mesmo executável: duas quedas só com `victory shaders`, nenhuma depois de `warm --used`. Numa máquina onde o cache da rota nunca foi usado, `warm --used` não tem lista de pipelines para seguir.
+- **#46, tradução de verdade do #30:** o defrag (`02384a60fda6f2d0`) passou a traduzir e a rodar. Ficam 231 sem tradução, 36 deles em grupos de 64. Os dois testes na placa batem bit a bit. No jogo: 2.137 dispatches em 3 minutos sem queda; **a imagem não foi conferida** (outro fork viu grade colorida nos rostos com o defrag rodando). `VICTORY_DEFRAG=0` desliga, mas a chave não entra na chave do cache: use um cache separado para comparar.
+- **#47, limpeza de listas fora da thread de envio (do mgrein):** entrou sem medição. `VICTORY_REAPER=0` volta ao caminho antigo.
+- **#49:** o `Play-VIctory.cmd` escolhe o perfil de console por palavra (`series-s`, `series-x`) e, sem palavra, pelo automático. **#50:** contadores de diagnóstico (views nulas por quadro; um aviso por conjunto de shaders descartado). **#52:** o `AGENTS.md` é a fonte única; máquinas em `machines.md`. **#54:** `scripts/measure/presentmon.ps1`.
+- **Teste de abertura na máquina A, pela pasta principal na `main`:** `Play-VIctory.cmd` chegou ao mundo em 40 s e rodou a 13-15 FPS com ~4.200 draws por quadro (release, Series S pelo automático, cache aquecido). No build de diagnóstico a memória privada chegou a 27,6 GB, com menos de 1 GB de RAM livre.
+- **Onde está o trabalho que falta:** #36 a #40 (relatos do playtest), #41 (hipótese no reaproveitamento; a leitura do código não a confirma), #42 (limpezas), #43 (26 commits do upstream revisados, por ordem de valor; não usar "Sync fork"), #44 (primeira rodada do medidor pelo `play.ps1`), #45 (cabelo por padrão), #53 (queda com cache frio). O desenho da tradução do #30 e a classificação das recusas em grupos de 64 estão em `findings/2026-11-27-desenho-da-traducao-30-e-recusas-de-grupos-de-64.md`.
+
 ## Em uma frase
 O port abre e chega ao mundo em placa NVIDIA no Windows 10, a 8-12 FPS e sem o roxo, mas está abaixo dos dois pisos de "jogável": falta FPS, a água tem retângulos, a vegetação pisca ao andar e a iluminação do jogo não roda.
 
@@ -49,31 +60,24 @@ Os achados citam os hashes dos branches de origem: o conserto mínimo do #30 é 
 ## O que NÃO está provado
 - Qualquer ganho de FPS por chave: as rodadas de `VICTORY_THIN=1` e `VICTORY_ASYNC_SUBMIT=1` foram únicas e em cenas diferentes.
 - As causas dos defeitos visuais em `gaps.md` e dos relatos em `relatos.md` (issues #36 a #40): são hipóteses com teste definido.
-- A tradução de verdade do #30 (`fix/30-exchange-in-current-block` `fdd93ea`): os testes na placa dão "device removed". Não levar ao jogo.
+- A tradução de verdade do #30 (PR #46, já na `main`): os testes na placa passam; falta conferir a imagem com o defrag rodando.
 - O efeito dos dois consertos do mgrein em Series X, e Series X nesta máquina (o modo automático só o escolhe com 48 GB de RAM).
 - As portas do renderer na NVIDIA (`VICTORY_PORT_*`): um fork mediu ganho numa RTX 4070, outro mediu perda numa RTX 5070.
 - O ray tracing do jogo em placa de grupos de 32: nunca houve rodada com `VICTORY_BVH_BUILDER=1` aqui.
 
 ## Próximos passos, por ordem
-Os passos 1 a 3 usam o medidor e os comparadores, que ainda são scripts locais (ver o fim deste arquivo).
+Os passos 1 a 3 usam o medidor e os comparadores de `scripts/measure/` (falta a primeira rodada por eles, #44).
 
 1. Comparação visual com giro de câmera, cada uma contra a base: `VICTORY_WAVE_WIDE=0` (retângulos e árvores), `VICTORY_TEXTURE_NO_WAIT=0` e `VICTORY_UPLOAD_AHEAD=0` (braço e escada pretos), guarda de textura no padrão.
 2. Se o item 1 confirmar a forma wide: portar a forma paired do fxceless atrás de chave (ver `references.md`), com o defrag fora.
 3. FPS por configuração, no mesmo ponto fixo, 3 rodadas: portas ligadas, `VICTORY_CARD_AWAKE` desligada, `VICTORY_PIPELINE_BOOK=0`, juntas e separadas.
-4. FPS por código: `a2cf68b` do mgrein (limpeza de listas fora da thread de envio), depois medir quanto do preparo é criação de views antes de portar a pilha de cópias de views.
-5. Provar `fdd93ea` na placa (o harness precisa ligar o root UAV `u252`, `SLOT_MEET`, o contador dos encontros) e decidir entre estender os half-meets e a forma paired para os 36 programas.
+4. FPS por código: medir o `a2cf68b` do mgrein, que já entrou (PR #47), com e sem `VICTORY_REAPER=0`; depois medir quanto do preparo é criação de views antes de portar a pilha de cópias de views.
+5. Conferir a imagem com o defrag rodando (PR #46) e decidir entre estender os half-meets e a forma paired para os 36 programas.
 6. Ray tracing, passo 0, sem jogo: traduzir o construtor com `VICTORY_HOST_MAX_WAVE=32` e listar o que recusa (`findings/2026-11-27-ray-tracing-em-grupos-de-32.md`). O caminho da DLL do construtor, que fica na pasta do jogo, é o usuário quem fornece.
 7. Memória: `VICTORY_TEXTURE_BUDGET_MB=4096`, `VICTORY_WINDOW_BUDGET_MB=1024` com `VICTORY_WINDOW_IDLE_MS=10000`, `VICTORY_UPLOAD_AHEAD=0`.
 
-## Branches fora deste conjunto
-Publicados como PR em rascunho quando passarem nos testes; até lá existem só na máquina das medições.
-
-| Branch | O que é | Por que ficou fora |
-|---|---|---|
-| `fix/30-exchange-in-current-block` | Tradução de verdade do #30 (`fdd93ea`) | Não provada na placa |
-| `diag/visual-counters` | Contadores de diagnóstico | Trabalho sem commit |
-| `fix/26-gpu-test-isolation` | Testes de GPU intermitentes (#26) | Pausada |
-| `diag/issue-2-memory` | Diagnóstico de memória (PR #19) | Antigo; rebasear ou fechar |
-
-## Ferramentas que ainda não estão no repositório
-O medidor (uma rodada, matriz de 3 rodadas em rodízio), o comparador de imagens por blocos e o comparador do giro de 360 graus são scripts Python locais. O método está em `findings/2026-11-27-medicao-e-comparacao-de-imagem.md`. Trazer para `scripts/` é uma lacuna aberta.
+## Branches e PRs fora da `main`
+| O quê | Estado |
+|---|---|
+| `fix/26-gpu-test-isolation` (#26) | Pausada, só na máquina A |
+| PR #19, diagnóstico de memória | Antigo; rebasear ou fechar |

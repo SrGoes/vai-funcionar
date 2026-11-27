@@ -21,13 +21,14 @@ Esse build ainda tinha o defeito do heap de samplers consertado depois em `413bb
 | R06 | Vegetação e árvores piscando ao andar | Várias | bloqueia | Culls de árvore na forma wide. Reserva de tabelas descartada (0 recusadas) | `VICTORY_WAVE_WIDE=0`, com giro de câmera | #40 | aberto |
 | R07 | Um braço e uma escada ficam pretos ao mover a câmera | Casa inicial | bloqueia | Textura na fila de envio (`VICTORY_TEXTURE_NO_WAIT=1`, `VICTORY_UPLOAD_AHEAD=1`) | Cada chave em 0 | #7 | aberto |
 | R08 | Imagem chapada, sem luz local; lâmpada acesa não ilumina o chão | Deque da casa, à noite | degrada (bloqueia no escuro) | A iluminação do jogo não roda: ~900 execuções de ray tracing por quadro ficam de fora | `VICTORY_BVH_BUILDER=1` depois de traduzir o construtor para grupos de 32 | #14 | aberto |
-| R09 | Véu cinza sobre a imagem inteira em interior | Lanchonete do posto | degrada | Luz substituta constante somada ao ar (`VICTORY_AMBIENT_AIR=1.5`) | `VICTORY_AMBIENT_AIR` em outros valores, mesma cena | #14 | aberto |
+| R09 | Véu cinza sobre a imagem inteira em interior | Lanchonete do posto | degrada | Em aberto. A suspeita inicial (`VICTORY_AMBIENT_AIR=1.5`) caiu: essa chave não roda com luz constante, que é o que a rota nvidia usa | Portar a luz do ar no modo constante (item 2 da #43) e rever a cena | #14, #43 | aberto |
 | R10 | Borrão e rastro em vegetação, barba e cabelo ao mexer a câmera | Várias | degrada | Reconstrução temporal a 10 FPS; o upscaler do jogo é recusado pelo port | Rever com FPS mais alto | #12 | aberto |
 | R11 | Um flash vermelho na tela inteira, uma vez | Casa inicial | ? | Nenhuma | Captura em rajada | | aberto |
 | R12 | Um retângulo no céu, de dia | Casa inicial | ? | A mesma dos retângulos da água | `VICTORY_WAVE_WIDE=0` | | aberto |
 | R13 | Céu todo preto à noite, sem estrelas nem nuvens | Píer | ? | Pode ser a noite do jogo sem a iluminação dele; não comparado com o console | Comparar com imagem de referência do console | | aberto |
 | R14 | 8 a 12 FPS em cena cheia, com travadas (1% mais lento a 3-7 FPS) | Mundo | bloqueia | O processador limita: 51-57 ms de preparo por quadro | `handoff.md`, passos 3 e 4 | #10, #13 | aberto |
 | R15 | Sobra menos de 1 GB de RAM livre com o jogo aberto em 32 GB | Mundo | bloqueia em sessão longa | Conjunto de trabalho de ~24 GB | `handoff.md`, passo 7 | #2 | aberto |
+| R16 | O jogo cai ao entrar no mundo (`0xc0000005`, escrita em 0) quando os pipelines não foram feitos antes | Carregamento, rota nvidia, cache novo | bloqueia a primeira abertura | `VICTORY_PIPELINE_WAIT_MS=0` descarta um dispatch cujo resultado o jogo lê de volta | A mesma abertura fria com outro valor dessa chave, e num build anterior ao #46 | #53 | aberto; contornado com `victory shaders` e `warm --used` |
 
 ## Resolvidos nesta rodada de trabalho
 | Nº | O que se via | Como saiu |
