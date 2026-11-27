@@ -19,7 +19,7 @@ Os defeitos vistos jogando estão numerados em `relatos.md`; aqui ficam as causa
 | Lacuna | O que se sabe | Próximo passo | Issue |
 |---|---|---|---|
 | 37 programas em grupos de 64 sem conversão (36 com a tradução de verdade do #30, que está fora do conjunto) | Todos recusam por "LDS in a group over 32"; três deles (`8b437ab6`, `477b52e7`, `17af85f1`) caem 1 vez por quadro e traduziam antes dos commits dos half-meets | Provar `fdd93ea` na placa; decidir half-meets ou forma paired | #11 |
-| Pânico do #30 | Conserto mínimo neste conjunto; tradução de verdade fora | PR próprio quando passar na placa | #30 |
+| Pânico do #30 | Só a recusa entrou (conserto mínimo); a issue pede também que o `victory shaders` trate um pânico como falha daquele shader e siga. Tradução de verdade fora | PR próprio quando passar na placa; a issue continua aberta | #30 |
 
 ## Desempenho e memória
 | Lacuna | O que se sabe | Próximo passo | Issue |
@@ -29,9 +29,12 @@ Os defeitos vistos jogando estão numerados em `relatos.md`; aqui ficam as causa
 | Sem perfil do processador | O `wpr` da máquina grava e falha ao salvar (0x80010106) | Instalar o Windows Performance Toolkit ou outro caminho | |
 | Cache frio | Mudar chave do tradutor esfria tudo | Pré-aquecimento por cache separado | #15 |
 
+| Quarentena do reaproveitamento (#32) | Hipótese de revisão, não confirmada: um buffer solto volta à reserva quando a submissão que o marcou termina, enquanto `retire_resource` espera mais submissões (`bury_lag`). Se uma submissão na fila ainda ler o buffer, ele pode ser zerado antes | Ler se a lista não enviada segura o `Arc`; `VICTORY_VIEW_BYTES_REUSE=0` na cena dos relatos R03 e R04 | |
+
 ## Processo
 | Lacuna | Próximo passo | Issue |
 |---|---|---|
 | Medidor e comparadores de imagem fora do repositório | Trazer para `scripts/` sem caminho local | |
 | Series X nunca medido na máquina de 32 GB | Uma rodada vigiada; os consertos do mgrein só valem lá | |
-| Testes de GPU intermitentes | Retomar `fix/26-gpu-test-isolation` | #26 |
+| Testes de GPU intermitentes | Retomar `fix/26-gpu-test-isolation`. O teste de GPU novo do reaproveitamento em `shadow.rs` pede `--test-threads=1` e não tem `#[ignore]` | #26 |
+| Limpezas apontadas na revisão do PR #34 | Três `agility.rs` quase iguais; testes repetidos no `play.ps1`; números de vendor soltos em `indirect.rs`; `xtask/src/agility.rs` cita uma issue de outro repositório; dispatch largo ligado por vendor com base numa única RTX 4070 | |

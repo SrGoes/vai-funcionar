@@ -26,14 +26,15 @@ O trabalho acontece em duas máquinas, as duas com GeForce. Todo número diz de 
 | Reaproveitamento das cópias de views (conserto da regressão de 12 para 3 FPS que entrou com o PR #28; issue #29, fechada) | PR #32, mesclado | Medido: 3,35 FPS sem, 12,49 com, 3 rodadas no mesmo ponto |
 | Agility SDK para o Windows 10 (`cargo xtask agility`) | PR #31, mesclado | Sem ele o port cai no primeiro quadro no Windows 10 |
 | Conserto mínimo do pânico do tradutor (#30) | `f0e268b` | `victory shaders` termina: 25.657 traduzidos, 232 sem tradução (195 sem programa e 37 em grupos de 64 sem conversão). O número do `CLAUDE.md` (229, com 26) é de outra máquina e de uma árvore anterior |
-| Filtro de sondas magenta na luz substituta (do Belobug `e942896`) | `64b9e8c` | NÃO resolveu o roxo no modo estimado; não age com `VICTORY_AMBIENT=constant`. Pode ser revertido sem efeito na rota nvidia |
 | Reserva de tabelas dinâmicas em heap limitado (do mgrein `d4b8094`) | `69c50a0`, `413bbc0` | Sem efeito medido em Series S (0 tabelas recusadas); vale para Series X. O `413bbc0` tira o heap de samplers desse ramo (defeito achado em revisão, inofensivo para a imagem) |
 | Dispatch indireto largo na NVIDIA (do mgrein `b2f561e`, `8f2ac66`) | `019b8ba`, `eeba481` | Só dispara em 2560x1440 (Series X); não medido aqui |
-| Captura por tempo e eixo do analógico em `VICTORY_KEYS` (só no build de diagnóstico) | `b5b2513` | Testes unitários ok; giro de câmera no jogo ainda não provado |
+| Eixo do analógico em `VICTORY_KEYS` (vale em qualquer build) e captura por tempo, com tempos contados do primeiro quadro do mundo (só no build de diagnóstico; no release o tempo `w<s>` nunca dispara) | `b5b2513` | Testes unitários ok; giro de câmera no jogo ainda não provado |
 | Launcher com rota explícita, norte, glossário, `docs/agents` | PR #33, mesclado | Dois revisores aprovaram; os dois atalhos abrem o jogo |
 | Esta passagem de bastão e os relatos de playtest | PR #34 | |
 
-Os achados citam os hashes dos branches de origem: o conserto mínimo do #30 é `36b998b` em `fix/30-half-meet-block` (aqui `f0e268b`) e o filtro de magenta é `562e4a5` (aqui `64b9e8c`).
+Os achados citam os hashes dos branches de origem: o conserto mínimo do #30 é `36b998b` em `fix/30-half-meet-block` (aqui `f0e268b`). O filtro de sondas magenta (`562e4a5`, do Belobug `e942896`) foi testado e NÃO entrou: não resolveu o roxo no modo estimado.
+
+**Cache de shaders:** o `f0e268b` mexe no tradutor, então a chave do cache muda em relação à `main` anterior: quem vem dela precisa refazer o pré-aquecimento. Os consertos do mgrein e a captura não mudam a chave.
 
 ## O que está provado aqui
 - **Regressão do PR #28 (issue #29):** o commit `8977bb0` manda toda view estruturada fora de 16 bytes para `shadow::exact()`, cujo cache é por endereço; o jogo muda o endereço todo quadro, e a NVIDIA (sem slot gêmeo) criava ~600 buffers por quadro. O reaproveitamento resolve. Detalhe em `findings/2026-11-27-regressao-28-e-reaproveitamento.md`.
