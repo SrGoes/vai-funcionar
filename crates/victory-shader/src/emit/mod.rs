@@ -507,9 +507,11 @@ pub fn emit(
     // it writes unwritten, and the title read that back as a pointer: a write to 0 at
     // +0x23cf683 loading the boat cutscene (#80) right after `ff6fdf23ce0b9048` failed so.
     // `VICTORY_LANE_SPLIT=exact` refuses such a program instead.
-    let refused_wide = matches!(&exact,
-        Err(ShaderError::Unsupported { what, .. }) if *what == lower::WAVE_WIDE_ELSEWHERE);
-    if !refused_wide || st.wave_scc.is_empty() || std::env::var_os("VICTORY_LANE_SPLIT").is_some_and(|v| v == "exact") {
+    // Any refusal: the branch taken as the wave's also makes the mask data, which keeps
+    // 64-lane waves or asks for exchanges where not every lane runs. Split per lane, a
+    // program unchanged by the split refuses the same way.
+    let refused = matches!(&exact, Err(ShaderError::Unsupported { .. }));
+    if !refused || std::env::var_os("VICTORY_LANE_SPLIT").is_some_and(|v| v == "exact") {
         return exact;
     }
     let again = structure::with_per_lane(|| {

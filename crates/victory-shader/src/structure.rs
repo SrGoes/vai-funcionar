@@ -479,6 +479,11 @@ pub fn with_per_lane<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
+/// Whether [`with_per_lane`] is in force on this thread.
+pub fn per_lane() -> bool {
+    PER_LANE.get()
+}
+
 /// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
     structure_wide(program, &HashSet::new())

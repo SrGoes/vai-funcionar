@@ -1579,7 +1579,9 @@ thread_local! {
 pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     // A scalar select or branch uses the condition of the whole guest wave,
     // even when the preceding mask operation has no scalar-dword consumers.
-    if matches!(i.fields, Fields::Sop { .. } | Fields::Sopp { .. } | Fields::Valu(_))
+    // (Split per lane, a branch goes by each lane's own bit, as before #66.)
+    let branch = matches!(i.fields, Fields::Sopp { .. }) && !crate::structure::per_lane();
+    if (branch || matches!(i.fields, Fields::Sop { .. } | Fields::Valu(_)))
         && i.read(Reg::Scc).is_some_and(|s| st.scc_some.contains_key(&s))
     {
         return true;
