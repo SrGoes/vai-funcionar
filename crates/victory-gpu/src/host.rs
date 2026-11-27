@@ -2882,7 +2882,7 @@ fn blame_stale(stale: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)]) 
 /// title memory read, took `us`.
 #[cfg(feature = "diagnostics")]
 fn blamed(why: usize, us: u64) {
-    let (named, refused) = std::mem::replace(&mut *BLAMED.lock().unwrap_or_else(|e| e.into_inner()), (None, ""));
+    let (named, refused) = std::mem::take(&mut *BLAMED.lock().unwrap_or_else(|e| e.into_inner()));
     let (key, at) = match (why, named) {
         (WHY_READ | WHY_STALE, Some(named)) => named,
         (WHY_READ, None) => (("a host copy of what a copy done on the card wrote", refused, 0, 0, 0), 0),
@@ -3681,6 +3681,7 @@ fn late_line(frames: f64) {
 pub(crate) mod aside;
 pub(crate) mod awake;
 mod card_steps;
+#[cfg(any(feature = "diagnostics", test))]
 pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]
 mod panel;
@@ -7739,7 +7740,7 @@ fn front_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize)>
                 given[i] = part;
             }
             Touch::Part => part += 1,
-            Touch::Title | Touch::Nothing => {}
+            Touch::Nothing => {}
         }
     }
     spans.retain(|s| s.1 < s.2);
@@ -7752,15 +7753,14 @@ enum Touch {
     Refresh(usize, usize, usize),
     /// The copy is given to shaders.
     Write(usize),
-    /// Title memory is written.
-    Title,
     Nothing,
     /// Another part of the submission begins.
     Part,
 }
 
-/// Of `steps`, up to the first that writes title memory: the copies given to
-/// shaders, each with the range its refreshes before that cover.
+/// Of `steps` (the caller stops them before the first that writes title
+/// memory): the copies given to shaders, each with the range its refreshes
+/// before that cover.
 fn written_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize)> {
     // (From, to, given to shaders.)
     let mut spans: ByCopy<(usize, usize, bool)> = ByCopy::default();
@@ -7778,7 +7778,6 @@ fn written_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize
                     span.2 = true;
                 }
             }
-            Touch::Title => break,
             Touch::Nothing | Touch::Part => {}
         }
     }
@@ -7791,7 +7790,7 @@ mod written_spans_tests {
 
     #[test]
     fn everything_is_refreshed_in_front_but_what_a_part_gave_its_shaders() {
-        use Touch::{Nothing, Part, Refresh, Title, Write};
+        use Touch::{Nothing, Part, Refresh, Write};
         let found = front_spans(
             [
                 Refresh(1, 10, 20),
@@ -7803,7 +7802,6 @@ mod written_spans_tests {
                 Refresh(1, 0, 100),
                 Write(3),
                 Refresh(3, 1, 2),
-                Title,
                 Refresh(4, 7, 9),
                 Part,
                 // The next part's bytes under the first one's writes.
@@ -7830,8 +7828,8 @@ mod written_spans_tests {
     }
 
     #[test]
-    fn what_is_written_is_refreshed_ahead_up_to_its_write_and_to_title_writes() {
-        use Touch::{Nothing, Refresh, Title, Write};
+    fn what_is_written_is_refreshed_ahead_up_to_its_write() {
+        use Touch::{Nothing, Refresh, Write};
         let mut found = written_spans(
             [
                 Refresh(1, 10, 20),
@@ -7844,8 +7842,6 @@ mod written_spans_tests {
                 Refresh(3, 1, 2),
                 Refresh(4, 7, 9),
                 Write(4),
-                Title,
-                Write(2),
             ]
             .into_iter(),
         );
