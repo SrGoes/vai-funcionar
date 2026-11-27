@@ -34,7 +34,7 @@ Os defeitos vistos jogando estão numerados em `relatos.md`; aqui ficam as causa
 ## Processo
 | Lacuna | Próximo passo | Issue |
 |---|---|---|
-| Medidor e comparadores de imagem fora do repositório | Trazer para `scripts/` sem caminho local | |
+| Medidor e comparadores de imagem fora do repositório | Trazidos para `scripts/measure/` (PR do medidor). Falta uma rodada nova por eles, pelo `play.ps1`, para provar a cadeia inteira | |
 | Series X nunca medido na máquina de 32 GB | Uma rodada vigiada; os consertos do mgrein só valem lá | |
 | Testes de GPU intermitentes | Retomar `fix/26-gpu-test-isolation`. O teste de GPU novo do reaproveitamento em `shadow.rs` pede `--test-threads=1` e não tem `#[ignore]` | #26 |
 | Limpezas apontadas na revisão do PR #34 | Três `agility.rs` quase iguais; testes repetidos no `play.ps1`; números de vendor soltos em `indirect.rs`; `xtask/src/agility.rs` cita uma issue de outro repositório; dispatch largo ligado por vendor com base numa única RTX 4070 | |

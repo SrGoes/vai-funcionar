@@ -31,6 +31,7 @@ O trabalho acontece em duas máquinas, as duas com GeForce. Todo número diz de 
 | Eixo do analógico em `VICTORY_KEYS` (vale em qualquer build) e captura por tempo, com tempos contados do primeiro quadro do mundo (só no build de diagnóstico; no release o tempo `w<s>` nunca dispara) | `b5b2513` | Testes unitários ok; giro de câmera no jogo ainda não provado |
 | Launcher com rota explícita, norte, glossário, `docs/agents` | PR #33, mesclado | Dois revisores aprovaram; os dois atalhos abrem o jogo |
 | Esta passagem de bastão e os relatos de playtest | PR #34 | |
+| Medidor (`bench.py`, `matrix.py`) e comparadores de imagem (`ab.py`, `vis360.py`) em `scripts/measure/`, com README | PR #35, sobre este | Testados offline nas rodadas de 26 e 27/11; a primeira rodada pelo `play.ps1` ainda não foi feita |
 
 Os achados citam os hashes dos branches de origem: o conserto mínimo do #30 é `36b998b` em `fix/30-half-meet-block` (aqui `f0e268b`). O filtro de sondas magenta (`562e4a5`, do Belobug `e942896`) foi testado e NÃO entrou: não resolveu o roxo no modo estimado.
 
