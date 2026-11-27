@@ -11,8 +11,10 @@
 #               at 7-11 min). This keeps it under: 1280x720 output with the title's own upscaler
 #               (FidelityFX divides by zero below 1080p on Series S), textures at most 1024
 #               texels a side, windows in the card's memory while it has room, hair on, the
-#               defrag (#46) left out until its picture is checked. Reached the open world
-#               (boat chase) at 7-10 fps with shared memory at 5.6-5.8 GB.
+#               defrag (#46) left out until its picture is checked, and the windows that lie in
+#               private memory read in place (VICTORY_INPLACE=1). Reached the open world
+#               (boat chase) at 7-10 fps with shared memory at 5.6-5.8 GB; with VICTORY_INPLACE=1,
+#               4.7 GB (median, 11 min, one run).
 # -Safe         without the newer, faster ways (the first thing to try when something is wrong)
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
 # -Build        target\diag (the default, the build all measurements are of) or target\release
@@ -112,6 +114,10 @@ if ($Route -eq 'amd') {
         $settings.VICTORY_OUTPUT = '1280x720'; $settings.VICTORY_UPSCALER = '6'
         $settings.VICTORY_TEXTURE_MAX = '1024'; $settings.VICTORY_WINDOWS_BAR_MB = '1536'
         $settings.VICTORY_HAIR = '1'; $settings.VICTORY_SKIP_PIPELINES = '02384a60fda6f2d0'
+        # Windows of title memory in private memory committed whole are read in
+        # place, no copy (~80 windows, ~0.4 GB on an RTX 5060 with 16 GB, 27/11):
+        # 11 min, no crash, no upload failure, picture checked on captures.
+        $settings.VICTORY_INPLACE = '1'
     }
     if ($Safe) { $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0' }
 }

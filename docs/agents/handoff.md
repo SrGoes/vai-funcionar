@@ -31,6 +31,14 @@ Branch `fix/shared-budget-guard`. Rota nvidia, build de diagnóstico da `main` e
   - 94% da espera dentro das chamadas de lista longas é a trava de `shadow::exact`, que varre ~4.000 cópias a cada miss (300-400 misses por quadro) e cria buffers segurando a trava;
   - a RAM vai para o disco o tempo todo (mediana de 9.644 páginas por segundo; RAM livre de 911 MB).
 
+  **Memória (abertura de diagnóstico e `VICTORY_INPLACE=1`, ver `findings/2026-11-27-memoria-maquina-b.md`):**
+  - ler no lugar funciona na RTX 5060 e lê tão rápido quanto hoje;
+  - o jogo mapeia páginas de 64 KB uma a uma, então só ~0,4 GB das janelas cabe no caminho sem cópia;
+  - os 8 GB write-combined são em maioria VRAM do pool de texturas mapeada pelo driver;
+  - com `VICTORY_INPLACE=1`, a memória compartilhada ficou em 4,7 GB de mediana, sem queda em 11 min. O jogador sentiu melhora; o FPS não foi provado (uma rodada, cena diferente).
+
+  A branch `test/smallram-inplace` (o PR #57 com `VICTORY_INPLACE=1` no `-SmallRam`) foi subida para o Lago testar.
+
   **Próximo passo:** abrir uma vez o build `test/night-smallram` (PR #56 com o PR #57, já compilado) com `-SmallRam` e a linha do tempo nos mesmos horários, para medir o `EXACT_LAZY` aqui. Depois, tirar a criação de buffer de dentro da trava.
 
 ## Em uma frase
