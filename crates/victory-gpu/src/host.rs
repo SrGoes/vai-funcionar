@@ -8368,7 +8368,11 @@ impl HostList {
         let (mut us, mut bytes) = (std::time::Duration::ZERO, 0u64);
         #[cfg(feature = "diagnostics")]
         let (mut copies, mut refreshes, mut refreshed) = (0u64, 0u64, 0u64);
-        for (i, step) in self.deferred().copies.iter().enumerate() {
+        let deferred = self.deferred();
+        // The steps up to this one (not it) had their refreshes flushed with the
+        // window they are in ([`Batch::flush_window`]).
+        let mut grouped = 0;
+        for (i, step) in deferred.copies.iter().enumerate() {
             if matches!(step, Step::Copy(..) | Step::Fill(..)) && taken(i) {
                 continue;
             }
@@ -8465,6 +8469,9 @@ impl HostList {
                     // the next flush of all (flushing all of them at every
                     // range a dispatch writes made thousands of write-watch
                     // askings a frame).
+                    if i >= grouped && flush_grouped() {
+                        grouped = i + batch.flush_window(&deferred.copies[i..]);
+                    }
                     batch.flush_one(shadow);
                     #[cfg(feature = "diagnostics")]
                     let snapshot = std::time::Instant::now();
@@ -8767,6 +8774,21 @@ fn copy_by_range() -> bool {
     // Read here: the switch of the copies by range.
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("VICTORY_COPY_BY_RANGE").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Whether the pending refreshes of the copies that shaders are given one
+/// after another, between two steps that write title memory, are flushed
+/// together, on several threads, at the first of them
+/// (`VICTORY_FLUSH_GROUPED=1`; off by default, A/B-able by that name): 384 a
+/// frame, one at a time on the submitting thread, 3.1 ms.
+fn flush_grouped() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_FLUSH_GROUPED") {
+        return on;
+    }
+    // Read here: the switch of the grouped flushes.
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_FLUSH_GROUPED").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// The title memory a write is told by: blocks of 64 KiB, where a texture or
@@ -9120,7 +9142,7 @@ fn written_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize
 
 #[cfg(test)]
 mod range_tests {
-    use super::{BLOCK, Batch};
+    use super::{BLOCK, Batch, Step};
     use crate::shadow::Shadow;
     use std::sync::Arc;
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
@@ -9286,6 +9308,64 @@ mod range_tests {
             }
             batch.title_written();
             assert!(batch.refreshes.is_empty());
+        }
+    }
+
+    #[test]
+    fn the_copies_a_window_of_shaders_writes_are_flushed_together_as_one_by_one_would() {
+        const LEN: usize = 4 * BLOCK;
+        let title = memory(LEN);
+        let ranges = [(0, 3000), (5000, 700), (20_000, 4000), (40_000, 90), (60_000, 8000), (100_000, 10)];
+        let copies: Vec<_> = ranges.iter().map(|&(from, len)| (copy(title + from, len), from, len)).collect();
+        let mut random = Random(0x1234_5678_9ABC_DEF1);
+        let steps: Vec<Step> = vec![
+            Step::GpuWrite(copies[0].0.0.clone(), title, 10),
+            Step::GpuWrite(copies[1].0.0.clone(), title + 5000, 10),
+            Step::GpuWrite(copies[0].0.0.clone(), title + 100, 10),
+            Step::GpuWrite(copies[2].0.0.clone(), title + 20_000, 10),
+            Step::GpuWrite(copies[3].0.0.clone(), title + 40_000, 10),
+            Step::Copy(title + 90_000, title, 4),
+            Step::GpuWrite(copies[4].0.0.clone(), title + 60_000, 10),
+        ];
+        for round in 0..50 {
+            let bytes: Vec<u8> = (0..LEN).map(|_| random.below(256) as u8).collect();
+            // SAFETY: title memory of the test's own.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), title as *mut u8, LEN) };
+            let mut held = Vec::new();
+            for grouped in [false, true] {
+                let mut batch = batch(false);
+                for ((shadow, _), from, len) in &copies {
+                    batch.add(shadow, title + from, *len);
+                }
+                let window = if grouped { batch.flush_window(&steps) } else { 0 };
+                if grouped {
+                    assert_eq!(window, 5, "round {round}: up to the copy");
+                    // Those of the window are done (four, on several threads), the
+                    // others are still pending.
+                    let left: Vec<usize> = batch.refreshes.iter().map(|r| r.1 - title).collect();
+                    assert_eq!(left.len(), 2, "round {round}: {left:?}");
+                    assert!(left.iter().all(|at| [60_000, 100_000].contains(at)), "{left:?}");
+                    for (shadow, _) in [&copies[4].0, &copies[5].0] {
+                        let at = batch.index[&(Arc::as_ptr(shadow) as usize)];
+                        assert!(Arc::ptr_eq(&batch.refreshes[at].0, shadow));
+                    }
+                }
+                for step in &steps {
+                    if let Step::GpuWrite(shadow, ..) = step {
+                        batch.flush_one(shadow);
+                    }
+                }
+                batch.flush();
+                held.push(copies.iter().map(|((_, data), _, len)| unsafe { std::slice::from_raw_parts(*data as *const u8, *len) }.to_vec()).collect::<Vec<_>>());
+                // The second starts from copies as empty as the first did.
+                for ((_, data), _, len) in &copies {
+                    unsafe { std::ptr::write_bytes(*data as *mut u8, 0, *len) };
+                }
+            }
+            assert_eq!(held[0], held[1], "round {round}");
+            for (((_, _), from, len), got) in copies.iter().zip(&held[1]) {
+                assert_eq!(&bytes[*from..from + len], got.as_slice(), "round {round}: refreshed");
+            }
         }
     }
 
@@ -9501,6 +9581,57 @@ impl Batch {
                 self.refreshes.push((shadow.clone(), address, end));
             }
         }
+    }
+
+    /// At a step that gives shaders a range of a copy (`steps` begin there):
+    /// the pending refreshes of the copies it and the `GpuWrite`s after it
+    /// give them, before the next step that writes title memory, are done
+    /// together. Gives how many steps that is.
+    fn flush_window(&mut self, steps: &[Step]) -> usize {
+        // Nothing in the window writes title memory, so what each refresh
+        // reads is what it would read at its own step.
+        let end = steps.iter().position(|s| matches!(s, Step::Copy(..) | Step::Run(_) | Step::Placed(_))).unwrap_or(steps.len());
+        let mut now: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+        for step in &steps[..end] {
+            let Step::GpuWrite(shadow, ..) = step else { continue };
+            let Some(at) = self.index.remove(&(std::sync::Arc::as_ptr(shadow) as usize)) else {
+                continue;
+            };
+            now.push(self.refreshes.swap_remove(at));
+            // The last entry took its place.
+            if let Some(moved) = self.refreshes.get(at) {
+                self.index.insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
+            }
+        }
+        if now.is_empty() {
+            return end;
+        }
+        let started = std::time::Instant::now();
+        let before = PREPARING[0].load(Ordering::Relaxed);
+        let light = crate::watch::light();
+        let n = now.len();
+        let work = move |i: usize| {
+            let (shadow, from, to) = &now[i];
+            if !(light && shadow.nothing_new(*from, *to - *from)) {
+                Self::update(shadow, *from, *to);
+            }
+        };
+        if n >= 4 && wide_refresh() {
+            crate::shadow::wide_each(n, work);
+        } else {
+            (0..n).for_each(work);
+        }
+        // The time counted is the time it took, not the threads' sum.
+        let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
+        PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        {
+            let ns = started.elapsed().as_nanos() as u64;
+            SPLIT[6].fetch_add(ns, Ordering::Relaxed);
+            SPLIT[9].fetch_add(ns, Ordering::Relaxed);
+            SPLIT[10].fetch_add(n as u64, Ordering::Relaxed);
+        }
+        end
     }
 
     /// Before shaders are given a range of `shadow`'s copy: its pending
