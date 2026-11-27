@@ -1,14 +1,37 @@
 @AGENTS.md
 
+Acompanhe as tarefas no [GitHub Issues deste repositório](https://github.com/SrGoes/vai-funcionar/issues).
+
+## Agent skills
+
+### Issue tracker
+
+As issues ficam no GitHub Issues de `SrGoes/vai-funcionar` (CLI `gh`). Veja `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Os cinco rótulos padrão, com o mesmo nome: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. Veja `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Contexto único: `GLOSSARY.md` na raiz e `docs/adr/` (criado quando houver a primeira decisão). Veja `docs/agents/domain.md`.
+
+### Passagem de bastão
+
+Antes de começar, leia `docs/agents/README.md`: estado (`handoff.md`), lacunas (`gaps.md`), forks já lidos (`references.md`) e achados datados (`findings/`). Ao terminar, atualize `handoff.md` e `gaps.md` no mesmo PR.
+
+
 # Contexto desta máquina
+
+Esta seção descreve a máquina do Goes (dono do repositório). Em outra máquina, confira a placa, a RAM e o sistema antes de usar estes números.
 
 - GPU: NVIDIA GeForce RTX 5060, 8 GB de VRAM, driver 621.40. CPU: Intel i5-13400F (AVX2). RAM: 16 GB (o README recomenda 64 GB; o perfil mais enxuto do projeto mira 32 GB).
 - Toolchain: Rust 1.98.1 (fixado em `rust-toolchain.toml`, em `%USERPROFILE%\.cargo\bin`), VS Build Tools 2026 com C++ e Windows SDK 10.0.26100.
 - Build usado nas medições: `cargo build --locked --profile diag -p victory --features diagnostics` → `target\diag\victory.exe`. Build release: `cargo build --release --locked -p victory`.
 - O dump fica fora do repositório e é passado por `VICTORY_GAME_DIR`, que o usuário define na própria janela. Se não estiver definida, pergunte o caminho ao usuário; não procure nem copie o dump.
 - `victory.toml` (ignorado pelo git) existe com `game_dir` comentado. Cache: `%LOCALAPPDATA%\victory\cache` (shaders traduzidos: 25.756 ok, 229 sem tradução, sendo 26 programas wave64 sem conversão para wave32, que é o que a NVIDIA executa). Saves: `%LOCALAPPDATA%\victory\data`.
-- Lançamento: `scripts\play.ps1 -Exe "$env:VICTORY_GAME_DIR\game_scarlett_master.exe"` (rota AMD, perfil Series X) ou `Play-VIctory.cmd pareto-residency` (rota testada em RTX, Series S, precisa do build release). `-Safe` desliga os caminhos novos; `-RayTracing` liga o RT.
-- O log só vai para o console. Para guardar, rode com `2>&1 | Tee-Object <arquivo>` e com `VICTORY_LOG`/`RUST_LOG` no nível desejado. Não grave logs dentro do repositório.
+- Lançamento: em placa NVIDIA, `Play-VIctory.cmd` (duplo clique) ou `scripts\play.ps1 -Exe "$env:VICTORY_GAME_DIR\game_scarlett_master.exe" -Route nvidia`; placa de 4 GB, `Play-VIctory-4GB.cmd`. Em placa AMD, `scripts\play.ps1 -Exe ... -Route amd` (o padrão). Meça sempre pela rota da placa. `-DryRun` imprime o kit sem abrir o jogo; `-Safe` desliga os caminhos novos; `-RayTracing` liga o ray tracing; `-Hair` liga o cabelo. No Windows 10, `cargo xtask agility` antes do build.
+- O log só vai para o console. Para guardar, rode com `2>&1 | Tee-Object <arquivo>` e com o nível desejado: `RUST_LOG` na janela, ou `-Vars "VICTORY_LOG=info"` no `play.ps1` e nos `.cmd` (o `play.ps1` apaga as `VICTORY_*` definidas na janela). Não grave logs dentro do repositório.
 
 # Ferramentas de arquivos (clonadas em `C:\Users\gabri\Downloads\vi-tools`)
 

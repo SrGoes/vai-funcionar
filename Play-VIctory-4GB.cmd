@@ -1,5 +1,13 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
+rem Double-click shortcut for 4 GB cards: scripts\play.ps1 -Route nvidia -LowMemory, which
+rem holds the kit of settings (and prints it). Other arguments go to play.ps1, for example
+rem   Play-VIctory-4GB.cmd -DryRun
+rem   Play-VIctory-4GB.cmd -Vars "VICTORY_THIN=1;VICTORY_LOG=info"
+rem Settings set in this window do not reach the title: play.ps1 starts from a clean kit.
+rem The route and the console are fixed here; for another console run play.ps1 itself.
+set "rest=%*"
+if /i "%~1"=="pareto-residency" call set "rest=%%rest:*pareto-residency=%%"
 if not defined VICTORY_GAME_DIR (
   echo Set VICTORY_GAME_DIR to the folder containing your title executable. 1>&2
   exit /b 2
@@ -10,36 +18,5 @@ if not exist "%VICTORY_GAME_DIR%\game_scarlett_master.exe" (
 )
 set "runner=%~dp0target\release\victory.exe"
 if not exist "%runner%" set "runner=%~dp0victory-3d-rtx-pareto-residency.exe"
-
-set "VICTORY_CACHE_DIR=%LOCALAPPDATA%\VIctory\cache-pareto"
-set "VICTORY_AMBIENT_AIR=1.5"
-set "VICTORY_AMBIENT=0.8"
-set "VICTORY_TEXTURE_NO_WAIT=1"
-set "VICTORY_RELAY=2"
-set "VICTORY_WIDE_BACK=1"
-set "VICTORY_CARD_REHASH_RUNS=1"
-set "VICTORY_JOIN_COPIES=1"
-set "VICTORY_INDIRECT_WINDOW=1"
-set "VICTORY_RELAY_COPY=1"
-set "VICTORY_CARD_STEPS=2"
-set "VICTORY_INDIRECT_BATCH=2"
-set "VICTORY_MAP_THREADS=1"
-set "VICTORY_CARD_AWAKE=1"
-set "VICTORY_SHOW_AFTER=1"
-if not defined VICTORY_THIN set "VICTORY_THIN=0"
-if not defined VICTORY_JOIN_PARTS set "VICTORY_JOIN_PARTS=0"
-if not defined VICTORY_LIBRARY_STORE_LATER set "VICTORY_LIBRARY_STORE_LATER=1"
-if not defined VICTORY_PIPELINE_WAIT_MS set "VICTORY_PIPELINE_WAIT_MS=0"
-if not defined VICTORY_PORT_CONSTANTS set "VICTORY_PORT_CONSTANTS=0"
-if not defined VICTORY_PORT_CBV set "VICTORY_PORT_CBV=0"
-if not defined VICTORY_UPLOAD_AHEAD set "VICTORY_UPLOAD_AHEAD=1"
-set "VICTORY_LEVELS_ON_DEMAND=1"
-
-:: 4 GB VRAM tuning: reduce card-buffer thrashing and driver background recompile threads
-set "VICTORY_CARD_BUFFERS_MIN_KB=4096"
-set "VICTORY_CARD_BUFFERS_MB=256"
-set "VICTORY_D3D12_BACKGROUND=0"
-if not defined VICTORY_LOG set "VICTORY_LOG=warn"
-
-"%runner%" run "%VICTORY_GAME_DIR%\game_scarlett_master.exe" --console series-s --execute
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\play.ps1" -Exe "%VICTORY_GAME_DIR%\game_scarlett_master.exe" -Route nvidia -LowMemory -Console series-s -Victory "%runner%" %rest%
 exit /b %errorlevel%
