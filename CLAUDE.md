@@ -16,6 +16,10 @@ Os cinco rótulos padrão, com o mesmo nome: `needs-triage`, `needs-info`, `read
 
 Contexto único: `GLOSSARY.md` na raiz e `docs/adr/` (criado quando houver a primeira decisão). Veja `docs/agents/domain.md`.
 
+### Passagem de bastão
+
+Antes de começar, leia `docs/agents/README.md`: estado (`handoff.md`), lacunas (`gaps.md`), forks já lidos (`references.md`) e achados datados (`findings/`). Ao terminar, atualize `handoff.md` e `gaps.md` no mesmo PR.
+
 
 # Contexto desta máquina
 
