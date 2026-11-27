@@ -1,0 +1,23 @@
+repo,nome,tipo,desc,stars,push,sumiu
+lynxnathan/rage-tools-vi,Rage Tools VI,Archive toolkit,"Python RPF9 toolkit: rebuilds archive entries from verified payloads, decodes audio and the script schema.",19,2026-11-25T21:25:22Z,False
+fishingpvalues/gta6-pc-port-hub,GTA VI PC port hub,Coordination hub,"Shared notes for port projects: package inventory, shader census format, common blockers.",6,2026-11-22T19:08:36Z,False
+holdmysocks/SixNG,SixNG,Asset extractor,"CLI and desktop app: models to glTF, textures and map data from your own install.",118,2026-11-27T01:24:13Z,False
+rpatty-dev/PercyStar,PercyStar,Archive explorer,Fast Rust RPF9 explorer with a Bink2 player and ADAT Opus audio decoder.,106,2026-11-25T09:49:54Z,False
+breadbbbb/rpf9-explorer,rpf9-explorer,Archive explorer,"Windows RPF explorer with model, texture, audio and video previews. Leonida builds on its decoders.",108,2026-11-24T07:58:59Z,False
+Ahmet-Dedeler/bcpack-rs,bcpack-rs,Texture codec,Clean-room decoder for Xbox BCPack textures. BC1 works; BC7 in progress.,19,2026-11-26T06:02:44Z,False
+nullbrik/RageForge,RageForge,RE toolkit,Explore and analyse RPF9 / TTPF archives.,2,2026-11-23T17:16:01Z,True
+woreksami/ttpf-studio,ttpf-studio,Texture tool,"View, export and replace .ttpf textures; Bink video playback.",16,2026-11-23T11:06:22Z,False
+walkthestars/GTA6-Asset-Info,GTA6-Asset-Info,Format notes,"Format notes for RPF9, textures, BCPack, models and map data.",10,2026-11-20T20:52:02Z,False
+Ahmet-Dedeler/awesome-gta6-reverse-engineering,awesome-gta6-RE,Curated list,Running list of open-source GTA VI reverse-engineering tools and layers.,795,2026-11-26T22:26:05Z,False
+HolyRoses/gta6-explorer,gta6-explorer,Asset explorer,"Read-only Python toolkit: browse your packages and extract textures, audio, video and shaders.",15,2026-11-26T20:35:03Z,False
+meetox80/6stars,6stars,World viewer,"From-scratch macOS engine (Swift, Metal) that renders the map, vegetation and weather from your own archives.",30,2026-11-22T12:37:16Z,False
+Ahmet-Dedeler/rage9-re,rage9-re,Data decoder,"Decodes the script and animation archives (PSO data, animations) with glTF export.",7,2026-11-24T03:07:23Z,False
+Albotterin/AWC_from_RPF9_Extractor,AWC from RPF9,Audio extractor,Pulls music streams (AWC) out of RPF9 archives.,6,2026-11-26T16:10:26Z,False
+SentinelInteractive/0x52504639,0x52504639,Format research,"RPF9 format notes, catalogues and tooling.",11,2026-11-26T21:27:04Z,False
+JoshRob297/rpf9-research,rpf9-research,Format research,"Spanish-language reverse engineering of the RPF9 header, table of contents and name table.",7,2026-11-24T19:42:10Z,False
+Librett0/vice-lens,Vice Lens,Asset explorer,"Desktop explorer for the map, models, animations, movies and sound in your own copy.",14,2026-11-22T20:35:26Z,False
+batatinhafcbatatinha-pixel/xseriesrecomp,xseriesrecomp,Front end,One launcher over bundled snapshots of four tracked projects; untested with any game.,0,2026-11-23T14:57:54Z,True
+sub-north/xbox-hle-lab,xbox-hle-lab,Test tools,"GPU probes, VM scripts and patches for XCL, for testing in a sandboxed VM.",7,2026-11-24T15:35:47Z,False
+kry-vex-gta/XBOX-Inspector,XBOX-Inspector,Build inspector,Rust desktop tool that inventories an unpacked Xbox Series build read-only and checks RPF9 headers and open data ranges. Russian-language docs.,8,2026-11-23T18:20:58Z,False
+nineforge0/forge9,forge9,Archive toolkit,"Rust RPF9 toolkit: inspect, extract and repack archives using keys from your own copy.",8,2026-11-26T07:52:19Z,False
+TheoBIET/OpenVI,OpenVI,Archive explorer,OpenIV-style desktop explorer for the RPF9 archives of your own install; views models and catalogs data.,12,2026-11-25T14:40:12Z,False
