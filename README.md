@@ -47,25 +47,31 @@ cargo build --release --locked -p victory
 
 ### Launch
 
+Use the kit of settings for your card. The two kits give different pictures and frame rates, so measure on the route of your card.
+
+| Card | Double-click | Same thing from PowerShell |
+|---|---|---|
+| NVIDIA GeForce | `Play-VIctory.cmd` | `scripts\play.ps1 -Exe <exe> -Route nvidia -Console series-x -Build release` |
+| 4 GB card or low-memory PC | `Play-VIctory-4GB.cmd` | `scripts\play.ps1 -Exe <exe> -Route nvidia -LowMemory -Console series-s -Build release` |
+| AMD Radeon | — | `scripts\play.ps1 -Exe <exe> -Route amd` (the default route) |
+
 ```powershell
 $env:VICTORY_GAME_DIR = 'D:\path\to\your\title'
-.\Play-VIctory.cmd
+.\Play-VIctory.cmd                 # or .\Play-VIctory.cmd -DryRun to print the settings and start nothing
 ```
 
-For 4 GB VRAM GPUs or low-memory systems:
+On Windows 10, run `cargo xtask agility` once before building: Windows 10's own D3D12 refuses the root signature of every translated pipeline and the title stops at its first frame.
 
-```powershell
-.\Play-VIctory-4GB.cmd
-```
+`scripts\play.ps1` holds both kits; the `.cmd` files are shortcuts to it. It clears the `VICTORY_*` settings left over in the window (it keeps `VICTORY_CONFIG`, `VICTORY_GAME_DIR`, `VICTORY_CACHE_DIR` and `VICTORY_DATA_DIR`), prints the whole kit it starts the title with, and takes extra settings as `-Vars "VICTORY_A=1;VICTORY_B=2"` (also through the `.cmd` files). `-DryRun` prints the kit and the command line without starting anything; `-Hair` turns the hair programs on (`VICTORY_HAIR=1`).
 
-*(Note: `Play-VIctory-4GB.cmd` caps card buffers to `VICTORY_CARD_BUFFERS_MB=256` and targets `--console series-s`; on 8 GB+ GPUs, use `Play-VIctory.cmd` instead. On 16 GB RAM machines, ensure an adequate Windows pagefile is configured to avoid commit exhaustion.)*
+*(`Play-VIctory-4GB.cmd` caps card buffers to `VICTORY_CARD_BUFFERS_MB=256` and targets `--console series-s`; on 8 GB+ GPUs, use `Play-VIctory.cmd` instead. On 16 GB RAM machines, ensure an adequate Windows pagefile is configured to avoid commit exhaustion.)*
 
 ### Diagnostics & Pre-warming
 
 ```powershell
 copy victory.example.toml victory.toml      # set your local paths outside this repo
 cargo build --locked --profile diag -p victory --features diagnostics
-scripts\play.ps1 -Exe <path_to_executable>
+scripts\play.ps1 -Exe <path_to_executable> -Route nvidia   # or -Route amd on a Radeon
 ```
 
 `scripts\play.ps1 -Safe` disables newer experimental paths; `-RayTracing` enables ray-traced indirect lighting.

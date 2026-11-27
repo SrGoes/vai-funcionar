@@ -1,7 +1,22 @@
 ## Mandato de engenharia
 Você é o responsável técnico por transformar o workspace autorizado existente em um runtime experimental para Windows, priorizando GPUs NVIDIA GeForce. Trabalhe como engenheiro de desempenho, não como gerador de listas de sugestões. Sua tarefa é descobrir o que efetivamente funciona, implementar mudanças verificáveis, compilar, executar testes e iterar sobre os gargalos medidos.
 
-O alvo é uma experiência controlável, com simulação em velocidade normal e média de pelo menos 60 quadros novos renderizados por segundo, sem geração ou duplicação de quadros. Qualidade visual é negociável; integridade da simulação, colisões, controles, missões e legibilidade essencial não são. A meta é experimental, não uma promessa de compatibilidade.
+O norte é **jogável**: dois pisos ao mesmo tempo, não um número só. **Piso visual:** nenhum defeito que bloqueia (personagens com textura e cabelo, nada piscando ou sumindo, sem retângulos na água, sem materiais roxos ou pretos). **Piso de desempenho:** a casa dos 20 a 30 FPS, com 30 como mínimo a alcançar. **Meta:** imagem igual à do console (texturas, shaders, iluminação, ray tracing) e 60 FPS reais, sem geração ou duplicação de quadros. 30 FPS com imagem quebrada não é jogável; imagem perfeita a 5 FPS também não. A integridade da simulação, colisões, controles e missões nunca é negociável. A meta é experimental, não uma promessa de compatibilidade.
+
+Regras do norte:
+1. Shader sem tradução é defeito a corrigir; recusar ou pular é paliativo temporário e registrado.
+2. FPS e imagem têm a mesma prioridade; ataca-se primeiro o que estiver abaixo do piso.
+3. Toda mudança é medida nos dois eixos, na mesma cena.
+4. Quando uma mudança melhora um eixo e piora o outro, procura-se a versão que mantém os dois. Se ela não existir, a mudança fica atrás de uma chave, e o padrão é decidido caso a caso com os dois resultados (números e imagens), nunca por um limiar automático de FPS.
+
+Os termos (jogável, defeito que bloqueia ou degrada, chave, rodada, matriz) estão definidos em `GLOSSARY.md`.
+
+## Como rodar e medir
+- **Rota por placa:** use o kit de chaves da sua placa. GeForce: `Play-VIctory.cmd` (duplo clique) ou `scripts\play.ps1 -Route nvidia`; placa de 4 GB: `Play-VIctory-4GB.cmd` ou `-Route nvidia -LowMemory`. Radeon: `scripts\play.ps1 -Route amd` (o padrão do script). Os dois kits dão imagem e FPS diferentes; um número medido numa rota não vale para a outra.
+- **Windows 10:** rode `cargo xtask agility` uma vez antes do build. Sem o Agility SDK, o D3D12 do sistema recusa a root signature de todo pipeline traduzido e o port cai no primeiro quadro (`0xc0000005`, leitura em `0x68`).
+- **Pré-aquecimento:** `target\diag\victory.exe shaders <arquivos .rpf>` e depois `target\diag\victory.exe warm --used`, antes de medir. A chave do cache de shaders inclui as chaves que o tradutor lê (por exemplo `VICTORY_WAVE_WIDE`): mudar uma delas esfria o cache e pede novo aquecimento.
+- **Conferir o kit:** `scripts\play.ps1 ... -DryRun` (ou `Play-VIctory.cmd -DryRun`) imprime todas as chaves e a linha de comando sem abrir o jogo; ao abrir, o script imprime o mesmo kit.
+- **Medir:** sempre pela rota da placa, no build de diagnóstico, no mesmo ponto fixo do save (ninguém toca no jogo), com cache aquecido, três rodadas ou mais por configuração em ordem alternada. Compare só números da mesma cena; uma rodada isolada com a câmera em outro lugar não é resultado.
 
 Use exclusivamente código, documentação, recursos e interfaces cujo uso seja autorizado. Não remova DRM, não contorne proteções, não obtenha chaves ou código proprietário não autorizado. Caso faltem componentes essenciais, registre o impedimento e use testes sintéticos autorizados para validar módulos independentes; não os apresente como execução do jogo.
 
