@@ -254,6 +254,31 @@ static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static CARD_RESERVED: AtomicU64 = AtomicU64::new(0);
 static CARD_ADMISSION: Mutex<()> = Mutex::new(());
 
+/// Whether a title buffer's card copy is admitted by the title's own bytes
+/// rather than its 64 KiB allocation, with room kept for large buffers that
+/// come late ([`card_reserved_bytes`]), and whether [`exact`]'s alignment
+/// copies get a card side too (`VICTORY_BUFFER_ADMISSION=1`; off by
+/// default). cool_fox 42ac562 + 6e434c6: on their RTX 4060 8 GB, 2.9 ->
+/// 11.35 FPS; off, the quota and the copies are as before.
+fn buffer_admission() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_BUFFER_ADMISSION") {
+        return on;
+    }
+    #[cfg(test)]
+    if ADMISSION_IN_TEST.get() {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_BUFFER_ADMISSION").is_ok_and(|v| v.trim() == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`buffer_admission`], for what this thread does.
+    static ADMISSION_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Keep at most one eighth of the existing quota (64 MiB on small cards)
 /// for large buffers first used after the other copies have been made.
 fn card_reserve(most: u64) -> u64 {
@@ -418,8 +443,9 @@ fn card_room_for(size: u64, len: u64) -> Option<(ID3D12Resource, u64)> {
     if !cards() {
         return None;
     }
+    let admitted = buffer_admission();
     let (least, most) = card_limits();
-    if !card_size_eligible(size, len, least) {
+    if !card_size_eligible(size, if admitted { len } else { size }, least) {
         return None;
     }
     let host = host()?;
@@ -464,7 +490,13 @@ fn card_room_for(size: u64, len: u64) -> Option<(ID3D12Resource, u64)> {
         let _admission = CARD_ADMISSION.lock().unwrap_or_else(|e| e.into_inner());
         let live = CARD_BYTES[0].load(Ordering::Relaxed);
         let kept = CARD_RESERVED.load(Ordering::Relaxed);
-        let Some(reserved_bytes) = card_reserved_bytes(size, len, live, kept, most) else {
+        // Off: the whole quota for any copy, no room kept.
+        let picked = if admitted {
+            card_reserved_bytes(size, len, live, kept, most)
+        } else {
+            (size <= most.saturating_sub(live)).then_some(0)
+        };
+        let Some(reserved_bytes) = picked else {
             #[cfg(feature = "diagnostics")]
             if std::env::var_os("VICTORY_TRACE_BUFFER_PLACEMENT").is_some() {
                 tracing::info!(size, live, kept, most, "card copy refused by byte quota");
@@ -5315,7 +5347,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // (`crate::inplace::place_for`): the buffer is the title's own
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
-        let big = cards() && (len >= card_limits().0 || card_all());
+        let big = cards() && ((if buffer_admission() { len } else { size }) >= card_limits().0 || card_all());
         // Renderer port 1 (`crate::port`, `VICTORY_PORT_CONSTANTS=1`): the
         // title's 32-bit graphics heap in place, big or not.
         if let Some(placed) = crate::port::place_for(key.0, len, false) {
@@ -5928,7 +5960,8 @@ fn exact_with(address: u64, len: u64, unlocked: bool, wide: bool) -> Option<Arc<
     // its original buffer was local: every access to a large compute
     // scratch view then crossed the bus. Use the same two-sided copy and
     // allocation limits as registered buffers, with the original fallback.
-    let carding = cards() && (len >= card_limits().0 || card_all());
+    let admitted = buffer_admission();
+    let carding = admitted && cards() && (len >= card_limits().0 || card_all());
     let width = exact_width(len, wide || carding);
     // Brought up to date as a new one is: zeros (no view sees past this).
     let zeroed = len.next_multiple_of(256);
@@ -5956,7 +5989,7 @@ fn exact_with(address: u64, len: u64, unlocked: bool, wide: bool) -> Option<Arc<
             }
         };
         // With a card side, the shared buffer is its staging.
-        Some((staging, data, card_for(width, len)))
+        Some((staging, data, if admitted { card_for(width, len) } else { None }))
     };
     let (buffer, data, card, mut guard) = if unlocked {
         drop(guard);
@@ -6102,6 +6135,12 @@ mod exact_card_tests {
         for (&offset, value) in offsets.iter().zip([11u32, 22, 33]) {
             unsafe { ((address as usize + offset) as *mut u32).write(value); }
         }
+        // Off (VICTORY_BUFFER_ADMISSION, the default): shared, as before.
+        let plain = exact(address, LEN as u64).unwrap();
+        assert!(!plain.carded(), "without the switch an alignment copy stays shared");
+        drop(plain);
+        EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.remove(&(address, LEN as u64));
+        ADMISSION_IN_TEST.set(true);
         let shadow = exact(address, LEN as u64).unwrap();
         assert!(shadow.carded(), "alignment copies must follow the GPU-local policy too");
         let mut heap = D3D12_HEAP_PROPERTIES::default();
