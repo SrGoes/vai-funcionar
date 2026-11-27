@@ -620,6 +620,8 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
 #[cfg(test)]
 pub enum Root {
     Constants(Vec<u32>),
+    /// A root UAV over the dispatch's UAV of this index in its views (a buffer).
+    Uav(usize),
     /// A table starting at this heap index.
     Table {
         sampler: bool,
@@ -868,7 +870,7 @@ impl Host {
                         at.ptr += (index * size) as u64;
                         list.SetGraphicsRootDescriptorTable(*param, at);
                     }
-                    Root::View { .. } => return Err("root views in a draw".into()),
+                    Root::View { .. } | Root::Uav(_) => return Err("root views in a draw".into()),
                 }
             }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
@@ -1442,6 +1444,12 @@ impl Host {
                         let mut at = h.GetGPUDescriptorHandleForHeapStart();
                         at.ptr += (index * size) as u64;
                         list.SetComputeRootDescriptorTable(*param, at);
+                    }
+                    Root::Uav(index) => {
+                        let Some((buffer, None, _, _)) = uavs.get(*index) else {
+                            return Err("a root UAV must name a buffer".into());
+                        };
+                        list.SetComputeRootUnorderedAccessView(*param, buffer.GetGPUVirtualAddress());
                     }
                     Root::View { srv, data } => {
                         let b = upload(data)?;
