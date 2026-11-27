@@ -8380,7 +8380,7 @@ impl HostList {
                         copies += 1;
                     }
                     batch.fill();
-                    batch.title_written();
+                    batch.title_written_in(dst, len);
                     crate::port::copied(dst, src, len);
                     // Renderer port #7: into a heap's records, the rounds
                     // asked earlier did not see it.
@@ -8420,7 +8420,7 @@ impl HostList {
                     let free = !touches(air, p.src, p.src + p.len) && !touches(air, p.dst, p.dst + p.len);
                     batch.fill();
                     if free {
-                        batch.title_written();
+                        batch.title_written_in(p.dst, p.len);
                     }
                     if let Some(bytes) = p.prepare(free) {
                         batch.placed.push((p.shadow.clone(), p.dst, bytes));
@@ -8477,7 +8477,7 @@ impl HostList {
                     continue;
                 }
                 Step::Texture(staging) => {
-                    if batch.texture_due(staging) {
+                    if batch.texture_due_staging(staging) {
                         batch.due.push(staging.clone());
                         if !wide_textures() {
                             batch.refresh_textures();
@@ -8489,7 +8489,7 @@ impl HostList {
                     // Sparse tile mappings must consume the mip mask from
                     // this refresh, rather than the preceding submission.
                     batch.refresh_textures();
-                    if batch.texture_due(staging) {
+                    if batch.texture_due_staging(staging) {
                         staging.refresh();
                     }
                     continue;
@@ -8743,10 +8743,95 @@ struct Batch {
     fills: Vec<(usize, usize, usize)>,
     /// Copies (by address) brought up to date ahead of the steps, and the
     /// range (from, to) ([`Batch::refresh_ahead`]).
-    ahead: ByCopy<(usize, usize)>,
+    ahead: ByCopy<(usize, usize, u32)>,
     /// `ahead` holds everything the submission refreshes
     /// ([`Batch::refresh_front`]).
     front: bool,
+    /// The title's writes the submission has made so far ([`copy_by_range`]).
+    writes: Writes,
+    /// With [`copy_by_range`]: each texture checked (by staging address) and
+    /// the `writes.clock` it was checked at, instead of `textures`.
+    texture_at: ByCopy<u32>,
+}
+
+/// Whether a title copy only touches what it writes (`VICTORY_COPY_BY_RANGE=1`;
+/// off by default, A/B-able by that name): the refreshes pending, the copies
+/// refreshed ahead and the textures checked are made again only where the
+/// copy crosses them. Off, a title copy is a flush of all of them and a new
+/// check of all the textures.
+fn copy_by_range() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_COPY_BY_RANGE") {
+        return on;
+    }
+    // Read here: the switch of the copies by range.
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_COPY_BY_RANGE").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// The title memory a write is told by: blocks of 64 KiB, where a texture or
+/// a buffer of the title starts and ends.
+const BLOCK: usize = 64 << 10;
+
+/// The title writes of a submission, for what is made again only if one
+/// crosses it (`ahead`, the textures checked): each write counts one on the
+/// `clock` and puts it on its blocks. Something looked at when the clock stood
+/// at `since` is as it was if no block of it was put on after, and no write
+/// that may be anywhere (`floor`) came.
+struct Writes {
+    by_range: bool,
+    clock: u32,
+    floor: u32,
+    blocks: ByCopy<u32>,
+}
+
+impl Default for Writes {
+    fn default() -> Self {
+        Writes { by_range: copy_by_range(), clock: 0, floor: 0, blocks: ByCopy::default() }
+    }
+}
+
+impl Writes {
+    /// `[from, to)` of title memory was written.
+    fn wrote(&mut self, from: usize, to: usize) {
+        // Past this many blocks it is cheaper to say it may be anywhere.
+        const MOST: usize = 1024;
+        if from >= to {
+            return;
+        }
+        let (first, last) = (from / BLOCK, (to - 1) / BLOCK);
+        if last - first >= MOST {
+            return self.anywhere();
+        }
+        self.clock += 1;
+        for block in first..=last {
+            self.blocks.insert(block, self.clock);
+        }
+    }
+
+    /// Something that may write anywhere ran.
+    fn anywhere(&mut self) {
+        self.clock += 1;
+        self.floor = self.clock;
+        self.blocks.clear();
+    }
+
+    /// Whether `[from, to)`, looked at when the clock stood at `since`, is
+    /// as it was (without `by_range` it is: every write makes all of it
+    /// again by itself).
+    fn unchanged(&self, from: usize, to: usize, since: u32) -> bool {
+        if !self.by_range || since == self.clock || from >= to {
+            return true;
+        }
+        if since < self.floor {
+            return false;
+        }
+        let (first, last) = (from / BLOCK, (to - 1) / BLOCK);
+        if last - first >= self.blocks.len() {
+            return self.blocks.iter().all(|(block, &at)| at <= since || !(first..=last).contains(block));
+        }
+        (first..=last).all(|block| self.blocks.get(&block).is_none_or(|&at| at <= since))
+    }
 }
 
 /// Whether the copies that a submission's shaders write are brought up to
@@ -9034,6 +9119,274 @@ fn written_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize
 }
 
 #[cfg(test)]
+mod range_tests {
+    use super::{BLOCK, Batch};
+    use crate::shadow::Shadow;
+    use std::sync::Arc;
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+
+    struct Random(u64);
+
+    impl Random {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 11) as usize % n
+        }
+    }
+
+    /// Plain memory (not write-watched: a refresh of it copies the whole range).
+    fn memory(len: usize) -> usize {
+        // SAFETY: a plain allocation, never given back.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(at, 0);
+        at
+    }
+
+    /// A batch that goes by range (or as before).
+    fn batch(by_range: bool) -> Batch {
+        let mut batch = Batch::default();
+        batch.writes.by_range = by_range;
+        batch
+    }
+
+    /// A copy of `[start, start + len)` of title memory, its own bytes apart.
+    fn copy(start: usize, len: usize) -> (Arc<Shadow>, usize) {
+        let data = memory(len);
+        (Shadow::unbacked(start as u64, data as *mut u8, len as u64, false), data)
+    }
+
+    #[test]
+    fn a_write_elsewhere_leaves_textures_checked_and_a_crossing_one_does_not() {
+        let mut batch = batch(true);
+        let (a, b) = (0x1000_0000, 0x1000_0000 + 8 * BLOCK);
+        assert!(batch.texture_due_in(1, a, a + 2 * BLOCK));
+        assert!(batch.texture_due_in(2, b, b + 2 * BLOCK));
+        assert!(!batch.texture_due_in(1, a, a + 2 * BLOCK));
+        // A copy into title memory far from both.
+        batch.title_written_in(a + 4 * BLOCK, 256);
+        assert!(!batch.texture_due_in(1, a, a + 2 * BLOCK));
+        assert!(!batch.texture_due_in(2, b, b + 2 * BLOCK));
+        // One into the first only.
+        batch.title_written_in(a + BLOCK + 17, 4);
+        assert!(batch.texture_due_in(1, a, a + 2 * BLOCK));
+        assert!(!batch.texture_due_in(1, a, a + 2 * BLOCK));
+        assert!(!batch.texture_due_in(2, b, b + 2 * BLOCK));
+        // Work that may write anywhere: all again.
+        batch.title_written();
+        assert!(batch.texture_due_in(2, b, b + 2 * BLOCK));
+        assert!(batch.texture_due_in(1, a, a + 2 * BLOCK));
+    }
+
+    /// Writes (of title memory, or anywhere) and checks of textures in random
+    /// order: a texture is due again if a write crossed its bytes (always),
+    /// and not if none touched a block of it (never), as the model tells.
+    #[test]
+    fn textures_are_due_again_if_and_only_if_a_write_crossed_them() {
+        let mut random = Random(0x9E37_79B9_7F4A_7C15);
+        const BASE: usize = 0x2000_0000;
+        let textures: Vec<(usize, usize)> = (0..40)
+            .map(|i| {
+                let from = BASE + i * 6 * BLOCK + random.below(BLOCK);
+                (from, from + 1 + random.below(4 * BLOCK))
+            })
+            .collect();
+        let mut batch = batch(true);
+        // Whether each was checked, and since then: a write crossed it, a
+        // write touched a block of it, or work that may write anywhere ran.
+        let mut checked = vec![false; textures.len()];
+        let mut crossed = vec![false; textures.len()];
+        let mut blocked = vec![false; textures.len()];
+        let (mut due, mut kept) = (0, 0);
+        for _ in 0..20_000 {
+            match random.below(20) {
+                0 => {
+                    batch.title_written();
+                    blocked.iter_mut().for_each(|b| *b = true);
+                    crossed.iter_mut().for_each(|b| *b = true);
+                }
+                1..=10 => {
+                    let at = BASE + random.below(40 * 6 * BLOCK);
+                    let len = 1 + if random.below(8) == 0 { random.below(3 * BLOCK) } else { random.below(300) };
+                    batch.title_written_in(at, len);
+                    for (i, &(from, to)) in textures.iter().enumerate() {
+                        crossed[i] |= at < to && from < at + len;
+                        blocked[i] |= at / BLOCK <= (to - 1) / BLOCK && from / BLOCK <= (at + len - 1) / BLOCK;
+                    }
+                }
+                _ => {
+                    let i = random.below(textures.len());
+                    let (from, to) = textures[i];
+                    let got = batch.texture_due_in(i, from, to);
+                    assert!(got || (checked[i] && !crossed[i]), "texture {i} crossed by a write and not due");
+                    assert!(!got || !checked[i] || blocked[i], "texture {i} due with no write at its blocks");
+                    (checked[i], crossed[i], blocked[i]) = (true, false, false);
+                    due += usize::from(got);
+                    kept += usize::from(!got);
+                }
+            }
+        }
+        // (The test sees both kinds of answer.)
+        assert!(due > 100 && kept > 100, "{due} due, {kept} kept");
+    }
+
+    #[test]
+    fn copies_refreshed_ahead_are_refreshed_again_only_behind_a_write_that_crosses_them() {
+        let start = 0x3000_0000;
+        let (shadow, _) = copy(start, 4 * BLOCK);
+        let mut batch = batch(true);
+        batch.front = true;
+        batch.ahead.insert(Arc::as_ptr(&shadow) as usize, (start, start + 4 * BLOCK, batch.writes.clock));
+        batch.add(&shadow, start + 10, 20);
+        assert!(batch.refreshes.is_empty(), "inside what was refreshed ahead");
+        // A write into another block of title memory.
+        batch.title_written_in(start + 8 * BLOCK, 64);
+        batch.add(&shadow, start + 10, 20);
+        assert!(batch.refreshes.is_empty(), "a write elsewhere");
+        batch.title_written_in(start + 3 * BLOCK + 5, 64);
+        batch.add(&shadow, start + 3 * BLOCK + 1, 20);
+        assert_eq!(batch.refreshes.len(), 1, "behind a write that crosses it");
+        // The rest of it is as it was refreshed.
+        batch.index.clear();
+        batch.refreshes.clear();
+        batch.add(&shadow, start + 10, 20);
+        assert!(batch.refreshes.is_empty());
+        batch.title_written();
+        batch.add(&shadow, start + 10, 20);
+        assert_eq!(batch.refreshes.len(), 1, "behind work that may write anywhere");
+    }
+
+    #[test]
+    fn a_write_flushes_the_pending_refreshes_that_it_crosses_and_not_the_others() {
+        let (a, b, c) = (0x4000_0000, 0x4100_0000, 0x4200_0000);
+        let copies = [copy(a, BLOCK), copy(b, BLOCK), copy(c, BLOCK)];
+        for by_range in [false, true] {
+            let mut batch = batch(by_range);
+            for (shadow, _) in &copies {
+                batch.add(shadow, shadow.span().0 as usize + 100, 200);
+            }
+            assert_eq!(batch.refreshes.len(), 3);
+            // Outside the three.
+            batch.title_written_in(b + 5000, 16);
+            let (pending, crossed) = if by_range { (3, "a") } else { (0, "all") };
+            assert_eq!(batch.refreshes.len(), pending, "{crossed}: pending after a write elsewhere");
+            assert_eq!(batch.index.len(), pending);
+            // Into the second one's range.
+            batch.title_written_in(b + 150, 4);
+            let pending = if by_range { 2 } else { 0 };
+            assert_eq!(batch.refreshes.len(), pending);
+            assert_eq!(batch.index.len(), pending);
+            if by_range {
+                // The index still finds those that are left.
+                for (shadow, _) in [&copies[0], &copies[2]] {
+                    let at = batch.index[&(Arc::as_ptr(shadow) as usize)];
+                    assert!(Arc::ptr_eq(&batch.refreshes[at].0, shadow));
+                }
+            }
+            batch.title_written();
+            assert!(batch.refreshes.is_empty());
+        }
+    }
+
+    /// Two batches, one that flushes all at every write and one that flushes
+    /// what the write crosses, get the same refreshes, writes and flushes of
+    /// one copy (as a shaders' write brings) in the same random order, on
+    /// title memory of their own: what each copy holds of what was asked of
+    /// it is the same.
+    #[test]
+    fn what_copies_hold_does_not_depend_on_which_writes_flush_them() {
+        const LEN: usize = 6 * BLOCK;
+        struct World {
+            title: usize,
+            copies: Vec<(Arc<Shadow>, usize)>,
+        }
+        let world = || {
+            let title = memory(LEN);
+            let copies = [(0, LEN / 2 - 100), (LEN / 4 + 17, LEN - LEN / 4 - 40), (LEN / 2, LEN / 2 - 3000), (700, 5000)]
+                .map(|(from, len)| copy(title + from, len))
+                .to_vec();
+            World { title, copies }
+        };
+        let worlds = [world(), world()];
+        let mut random = Random(0x2545_F491_4F6C_DD1D);
+        for round in 0..400 {
+            let mut batches = [batch(false), batch(true)];
+            // What each copy is asked for in this submission: one range, so that
+            // a flush reads nothing it was not asked (what lies between two
+            // ranges of a flush is read too, later than it was asked).
+            let windows: Vec<(usize, usize)> = worlds[0]
+                .copies
+                .iter()
+                .map(|(shadow, _)| {
+                    let (start, len) = shadow.span();
+                    let (start, len) = (start as usize - worlds[0].title, len as usize);
+                    let from = random.below(len);
+                    let most = if random.below(4) == 0 { len } else { 400 };
+                    (start + from, 1 + random.below((len - from).min(most)))
+                })
+                .collect();
+            // What was asked of each copy: (copy, from, bytes), as offsets in title memory.
+            let mut asked = Vec::new();
+            for _ in 0..4 + random.below(30) {
+                match random.below(10) {
+                    0..=3 => {
+                        let c = random.below(worlds[0].copies.len());
+                        let (at, n) = windows[c];
+                        asked.push((c, at, n));
+                        for (w, batch) in worlds.iter().zip(&mut batches) {
+                            batch.add(&w.copies[c].0, w.title + at, n);
+                        }
+                    }
+                    4..=7 => {
+                        let most = if random.below(6) == 0 { 2 * BLOCK } else { 200 };
+                        let n = 1 + random.below(most);
+                        let at = random.below(LEN - n);
+                        let bytes: Vec<u8> = (0..n).map(|_| random.below(256) as u8).collect();
+                        for (w, batch) in worlds.iter().zip(&mut batches) {
+                            batch.fill();
+                            batch.title_written_in(w.title + at, n);
+                            // SAFETY: title memory of the world's own.
+                            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), (w.title + at) as *mut u8, n) };
+                        }
+                    }
+                    8 => {
+                        let c = random.below(worlds[0].copies.len());
+                        for (w, batch) in worlds.iter().zip(&mut batches) {
+                            batch.flush_one(&w.copies[c].0);
+                        }
+                    }
+                    _ => {
+                        let at = random.below(LEN - 8);
+                        for (w, batch) in worlds.iter().zip(&mut batches) {
+                            batch.title_written();
+                            // SAFETY: as above.
+                            unsafe { ((w.title + at) as *mut u64).write_unaligned(round as u64 * 0x0101_0101) };
+                        }
+                    }
+                }
+            }
+            for batch in &mut batches {
+                batch.flush();
+            }
+            for (c, at, n) in asked {
+                let held = |w: &World| {
+                    let start = w.copies[c].0.span().0 as usize - w.title;
+                    // SAFETY: the copy's bytes, nothing writes them now.
+                    unsafe { std::slice::from_raw_parts((w.copies[c].1 + at - start) as *const u8, n) }.to_vec()
+                };
+                let (x, y) = (held(&worlds[0]), held(&worlds[1]));
+                if x != y {
+                    let d = (0..n).find(|&i| x[i] != y[i]).unwrap();
+                    let ti = |w: &World| unsafe { *((w.title + at + d) as *const u8) };
+                    panic!("DEBUG round {round}: copy {c} at {at:#x}+{n:#x}: first diff at +{d}: model {} new {}; title model {} new {}", x[d], y[d], ti(&worlds[0]), ti(&worlds[1]));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod written_spans_tests {
     use super::{Touch, front_spans, split, written_spans};
 
@@ -9135,7 +9488,7 @@ impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
-        if self.ahead.get(&key).is_some_and(|&(from, to)| from <= address && end <= to) {
+        if self.ahead.get(&key).is_some_and(|&(from, to, since)| from <= address && end <= to && self.writes.unchanged(address, end, since)) {
             return;
         }
         match self.index.get(&key) {
@@ -9198,12 +9551,85 @@ impl Batch {
         self.textures.insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
     }
 
-    /// Before a step that writes title memory: pending refreshes are done
-    /// first, and textures are checked again after it.
+    /// [`Batch::texture_due`] of a staging buffer, which tells what title
+    /// memory it is read from.
+    fn texture_due_staging(&mut self, staging: &std::sync::Arc<crate::texture::Staging>) -> bool {
+        if !self.writes.by_range {
+            return self.texture_due(staging);
+        }
+        let (at, len) = staging.memory();
+        self.texture_due_in(std::sync::Arc::as_ptr(staging) as usize, at, at + len)
+    }
+
+    /// With [`copy_by_range`]: whether the texture `key`, read from title
+    /// memory `[from, to)`, is still to be refreshed in this submission: it
+    /// was not checked, or a write crossed it since.
+    fn texture_due_in(&mut self, key: usize, from: usize, to: usize) -> bool {
+        let now = self.writes.clock;
+        match self.texture_at.get(&key) {
+            Some(&since) if self.writes.unchanged(from, to, since) => false,
+            _ => {
+                self.texture_at.insert(key, now);
+                true
+            }
+        }
+    }
+
+    /// Before a step that writes title memory anywhere: pending refreshes are
+    /// done first, and textures are checked again after it.
     fn title_written(&mut self) {
         self.flush();
+        self.writes.anywhere();
         self.ahead.clear();
         self.textures.clear();
+    }
+
+    /// Before a step that writes `[dst, dst + len)` of title memory: with
+    /// [`copy_by_range`], only what crosses it is done first and checked
+    /// again after it.
+    fn title_written_in(&mut self, dst: usize, len: usize) {
+        if !self.writes.by_range {
+            return self.title_written();
+        }
+        if len == 0 {
+            return;
+        }
+        // Many pending: looking at each, at every one of some 12,000 writes a
+        // frame, costs more than it saves.
+        const FEW: usize = 256;
+        if self.refreshes.len() > FEW || self.due.len() > FEW {
+            self.flush();
+        } else {
+            self.flush_crossing(dst, dst + len);
+        }
+        // (`ahead` and the textures checked are asked, not cleared.)
+        self.writes.wrote(dst, dst + len);
+    }
+
+    /// The pending refreshes and textures due that read `[from, to)` of title
+    /// memory are done, the others stay pending.
+    fn flush_crossing(&mut self, from: usize, to: usize) {
+        let crosses = |a: usize, b: usize| a < to && from < b;
+        let textures = |staging: &std::sync::Arc<crate::texture::Staging>| {
+            let (at, len) = staging.memory();
+            crosses(at, at + len)
+        };
+        if self.due.iter().any(textures) {
+            let (now, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.due).into_iter().partition(textures);
+            self.due = now;
+            self.refresh_textures();
+            self.due = later;
+        }
+        if self.refreshes.iter().any(|r| crosses(r.1, r.2)) {
+            let (now, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.refreshes).into_iter().partition(|r| crosses(r.1, r.2));
+            self.refreshes = now;
+            self.flush_refreshes();
+            self.refreshes = later;
+            self.index.clear();
+            for (at, refresh) in self.refreshes.iter().enumerate() {
+                self.index.insert(std::sync::Arc::as_ptr(&refresh.0) as usize, at);
+            }
+        }
     }
 
     /// Before the steps of `runs` ([`refresh_front`]), a new part of the
@@ -9241,7 +9667,7 @@ impl Batch {
             let fronts: Vec<ListFront> = fronts.iter().map(|m| m.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default()).collect();
             for front in &fronts {
                 for staging in &front.textures {
-                    if self.texture_due(staging) {
+                    if self.texture_due_staging(staging) {
                         due.push(staging.clone());
                     }
                 }
@@ -9269,7 +9695,7 @@ impl Batch {
                     }
                     Step::GpuWrite(shadow, ..) => touches.push(Touch::Write(std::sync::Arc::as_ptr(shadow) as usize)),
                     Step::Texture(staging) if wide_textures() => {
-                        if self.texture_due(staging) {
+                        if self.texture_due_staging(staging) {
                             due.push(staging.clone());
                         }
                     }
@@ -9296,7 +9722,7 @@ impl Batch {
         planning.end();
         self.front = true;
         for (shadow, from, to) in &spans {
-            self.ahead.insert(std::sync::Arc::as_ptr(shadow) as usize, (*from, *to));
+            self.ahead.insert(std::sync::Arc::as_ptr(shadow) as usize, (*from, *to, self.writes.clock));
         }
         #[cfg(feature = "diagnostics")]
         {
@@ -9379,7 +9805,7 @@ impl Batch {
             .filter_map(|(key, from, to)| Some((copies.get(&key)?.clone(), from, to)))
             .collect();
         for (shadow, from, to) in &due {
-            self.ahead.insert(std::sync::Arc::as_ptr(shadow) as usize, (*from, *to));
+            self.ahead.insert(std::sync::Arc::as_ptr(shadow) as usize, (*from, *to, self.writes.clock));
         }
         #[cfg(feature = "diagnostics")]
         let began = std::time::Instant::now();
@@ -9448,6 +9874,11 @@ impl Batch {
     fn flush(&mut self) {
         self.refresh_textures();
         self.index.clear();
+        self.flush_refreshes();
+    }
+
+    /// The pending refreshes are done.
+    fn flush_refreshes(&mut self) {
         if self.refreshes.is_empty() {
             return;
         }
