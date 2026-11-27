@@ -222,6 +222,9 @@ pub(crate) fn called(took: std::time::Duration) {
     if !on() {
         return;
     }
+    if SAMPLE_RECORDERS.load(Ordering::Relaxed) {
+        register(&RECORDERS);
+    }
     let inside = (took.as_nanos() as u64).saturating_mul(frequency()) / 1_000_000_000;
     let t1 = ticks();
     let t0 = t1 - inside;
@@ -334,14 +337,36 @@ pub(crate) fn polled(at: usize, value: u64) {
 /// Threads of the title's that submit or present.
 static TITLES: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
 
+/// Threads of the title's that record lists (they make list calls), found by
+/// those calls; sampled only if [`sample_recorders`] says so.
+static RECORDERS: [AtomicU32; 8] = [const { AtomicU32::new(0) }; 8];
+
+/// Whether this recording samples the recorders.
+static SAMPLE_RECORDERS: AtomicBool = AtomicBool::new(false);
+
+/// `VICTORY_TIMELINE_RECORDERS=1` (or the switch of that name in
+/// `VICTORY_AB`): the recording threads are sampled too. Off: sampling them
+/// suspends five more threads each time, which costs the title.
+fn sample_recorders() -> bool {
+    if let Some(on) = crate::ab::pick("VICTORY_TIMELINE_RECORDERS") {
+        return on;
+    }
+    std::env::var("VICTORY_TIMELINE_RECORDERS").is_ok_and(|v| v.trim() == "1")
+}
+
 /// This thread is one of the title's that submit: what it does is sampled.
 #[inline(always)]
 pub(crate) fn title_thread() {
     if !on() {
         return;
     }
+    register(&TITLES);
+}
+
+/// This thread's number is among `places`, if there is room.
+fn register(places: &[AtomicU32]) {
     let id = thread();
-    for place in &TITLES {
+    for place in places {
         match place.load(Ordering::Relaxed) {
             there if there == id => return,
             0 if place.compare_exchange(0, id, Ordering::Relaxed, Ordering::Relaxed).is_ok() => return,
@@ -352,7 +377,9 @@ pub(crate) fn title_thread() {
 
 /// Looks every quarter of a millisecond where the title's submitting threads
 /// are, while the recording goes on: what they do outside our calls (a loop
-/// on a value in memory has no event of its own).
+/// on a value in memory has no event of its own). The recorders, if asked
+/// for, are looked at too, but for their instruction alone (no stack: the
+/// summary counts addresses, and stacks are few).
 fn sample() {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Diagnostics::Debug::{CONTEXT, CONTEXT_CONTROL_AMD64, GetThreadContext};
@@ -364,9 +391,10 @@ fn sample() {
     struct Aligned(CONTEXT);
     let mut open: Vec<(u32, *mut std::ffi::c_void)> = Vec::new();
     while on() {
-        for place in &TITLES {
+        for (place, deep) in TITLES.iter().map(|p| (p, true)).chain(RECORDERS.iter().map(|p| (p, false))) {
             let id = place.load(Ordering::Relaxed);
-            if id == 0 {
+            // A recorder that is also a title thread is looked at as one.
+            if id == 0 || (!deep && TITLES.iter().any(|t| t.load(Ordering::Relaxed) == id)) {
                 continue;
             }
             let thread = match open.iter().find(|o| o.0 == id) {
@@ -393,7 +421,7 @@ fn sample() {
                     continue;
                 }
                 let known = GetThreadContext(thread, &mut context.0) != 0;
-                if known {
+                if known && deep {
                     let sp = context.0.Rsp as usize & !7;
                     let n = ((sp | 0xfff) + 1 - sp) / 8;
                     for (i, word) in words.iter_mut().enumerate().take(n) {
@@ -411,7 +439,7 @@ fn sample() {
             for (frame, word) in frames.iter_mut().zip(near) {
                 *frame = word;
             }
-            put_of(id, Kind::Sample, "a sample", (t, t), at as u64, 0, keep(frames));
+            put_of(id, Kind::Sample, "a sample", (t, t), at as u64, 0, if deep { keep(frames) } else { 0 });
         }
         let until = ticks() + frequency() / 4000;
         while ticks() < until {
@@ -593,6 +621,7 @@ pub(super) fn make_room() {
 
 /// Recording starts.
 pub(super) fn begin() {
+    SAMPLE_RECORDERS.store(sample_recorders(), Ordering::SeqCst);
     ON.store(true, Ordering::SeqCst);
 }
 
@@ -610,7 +639,8 @@ pub(super) fn end() -> Data {
     // Those about to write do.
     std::thread::sleep(std::time::Duration::from_millis(20));
     let taken = NEXT.load(Ordering::SeqCst);
-    TITLES.iter().for_each(|t| t.store(0, Ordering::SeqCst));
+    TITLES.iter().chain(&RECORDERS).for_each(|t| t.store(0, Ordering::SeqCst));
+    SAMPLE_RECORDERS.store(false, Ordering::SeqCst);
     let slots = SLOTS.load(Ordering::Acquire);
     let mut events = Vec::with_capacity(taken.min(EVENTS));
     for at in 0..taken.min(EVENTS) {
