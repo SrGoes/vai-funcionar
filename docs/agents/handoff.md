@@ -20,7 +20,7 @@ O trabalho acontece em duas máquinas, as duas com GeForce. Todo número diz de 
 - **O `Play-VIctory.cmd` força Series X.** Nada foi medido em Series X na máquina A; o modo automático só escolhe Series X com 48 GB de RAM e 12 GB de VRAM.
 - As duas placas têm folga para o jogo: na máquina A a placa fica 43-54% ocupada e quem limita o FPS é o processador preparando cada quadro (ver abaixo).
 
-## O que entrou na main em 27/11
+## O que entrou na main em 27/11 (PRs #31 a #34)
 | Peça | Commits | Estado |
 |---|---|---|
 | Reaproveitamento das cópias de views (conserto da regressão de 12 para 3 FPS que entrou com o PR #28; issue #29, fechada) | PR #32, mesclado | Medido: 3,35 FPS sem, 12,49 com, 3 rodadas no mesmo ponto |
@@ -40,7 +40,7 @@ Os achados citam os hashes dos branches de origem: o conserto mínimo do #30 é 
 - **Regressão do PR #28 (issue #29):** o commit `8977bb0` manda toda view estruturada fora de 16 bytes para `shadow::exact()`, cujo cache é por endereço; o jogo muda o endereço todo quadro, e a NVIDIA (sem slot gêmeo) criava ~600 buffers por quadro. O reaproveitamento resolve. Detalhe em `findings/2026-11-27-regressao-28-e-reaproveitamento.md`.
 - **Roxo:** vem da luz substituta em modo estimado. `VICTORY_AMBIENT=constant:0.8` (o valor da rota nvidia) tira. O preço é a imagem chapada.
 - **O que falta em cada quadro (log do build de diagnóstico):** ~900-940 execuções "shades ray-tracing hits without BVH" (a iluminação do jogo), 258-283 estágios do construtor de ray tracing, e 1 por quadro de cada compute sem tradução: `8b437ab61d8008fe`, `477b52e73ddeb6f2`, `17af85f170e66f30` e o defrag `02384a60fda6f2d0`. Quase tudo o que falta é ray tracing.
-- **O limite de FPS é o processador:** 74-94 ms de quadro, dos quais 51-57 ms de preparo (cópias 14-22 ms, texturas 11-19 ms) e 12-17 ms de cópia de volta; 34-72 mil chamadas de lista por quadro. Com `VICTORY_CARD_BUFFERS_MIN_KB=64` a placa cai de 92% para 43-54% ocupada e o FPS não sobe.
+- **O limite de FPS é o processador:** 74-94 ms de quadro, dos quais 51-57 ms de preparo (cópias 14-22 ms, texturas 11-19 ms) e 12-17 ms de cópia de volta; 34-72 mil chamadas de lista por quadro. Com o kit da rota nvidia (que inclui `VICTORY_CARD_BUFFERS_MIN_KB=64`) a placa cai de 92% para 43-54% ocupada e o FPS não sobe; qual chave do kit responde por isso não foi isolado.
 - **PresentMon (kit antigo, 60 s):** 11,1 FPS, quadro mediano 90 ms, p95 145, p99 181, sem VSync. Release e diagnóstico rendem igual.
 - **Memória:** 24-25 GB privados com o kit da rota nvidia, RAM livre caindo abaixo de 1 GB em 32 GB. Um vazamento pequeno, de 30-50 MB por minuto, foi medido numa sessão de 61 min do build antigo; na série de 6 min do build atual ele não aparece.
 - **Reserva de tabelas:** de 14 a 28 mil tabelas pedidas por quadro conforme a cena (máximo visto 28.264) e 0 recusadas em Series S. Não é a causa do pisca aqui.
