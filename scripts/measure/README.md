@@ -41,3 +41,17 @@ python scripts\measure\vis360.py run cand nvidia diag $giro 45        # com VIS_
 python scripts\measure\vis360.py compare <rodada base> <rodada cand> <saída> --giro 21-35 --mask 460,130,760,440
 ```
 O roteiro: mundo, 20 s parado, rajada de 10 quadros seguidos, giro de 360 graus em 12 s com um print a cada 0,5 s, outra rajada aos 40 s, e fecha aos 45 s. O `compare` casa as capturas pelo tempo desde o primeiro quadro do mundo, então o mesmo ângulo cai no mesmo par mesmo com FPS diferente. Saída: uma folha de contato por ângulo (base, candidato, diferença), o pisca de cada rajada (um bloco que muda num quadro e volta no seguinte) e os draws descartados por motivo.
+
+## Tempo de cada quadro com o PresentMon: `presentmon.ps1`
+O título da janela dá o FPS médio; o PresentMon dá o tempo de cada quadro, de onde saem a mediana, o p95, o p99 e as travadas. Ele mede o jogo que **já está aberto**: abra pelo `Play-VIctory.cmd` ou pelo `scripts\play.ps1`, chegue ao mundo e rode em outra janela.
+
+```powershell
+scripts\measure\presentmon.ps1 -PresentMon <caminho do PresentMon-x64.exe> -Seconds 60
+scripts\measure\presentmon.ps1 -Csv <um frames.csv já gravado>      # só o resumo
+```
+
+- O PresentMon (Intel, `github.com/GameTechDev/PresentMon`) não vem no repositório: baixe o executável de console e passe o caminho.
+- Gravar pede uma janela do PowerShell como administrador, ou o usuário no grupo "Performance Log Users". O jogo nunca roda como administrador e este script não o abre nem fecha.
+- Saída: `frames.csv` e `summary.txt` numa pasta nova em `%TEMP%` (ou em `-Out`), nunca no repositório.
+- O resumo traz quadros, FPS médio, mediana, p95, p99 e o quadro mais longo, o 1% mais lento (1000 / p99, posto mais próximo), quantos quadros passaram de 150 ms, as médias de `MsCPUBusy`, `MsCPUWait`, `MsGPUBusy` e `MsGPUWait`, o intervalo de sincronização e o modo de apresentação.
+- Para o perfil do processador (onde o tempo de preparo é gasto) ainda não há ferramenta aqui: o `wpr` do Windows gravou e falhou ao salvar na máquina das medições.
