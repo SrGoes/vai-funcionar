@@ -143,3 +143,29 @@ Branch `test/smallram-night` (`7df2b25`): o PR #56 com os commits do PR #57. Rod
   Próxima medida: `VICTORY_GPU_TIMING`, que cronometra cada lista na placa.
 - **Nas cenas pesadas, as travas das threads de gravação voltam a mandar.** O próximo código continua sendo a `EXACT` (criação fora da trava, varredura fora do miss), com a `texture_at_global` em seguida.
 - **Na máquina A, os ~70 ms por quadro de "o jogo ainda não enviou"** com a branch sem o PR #56 (comentário do Lago no PR #57) são essas mesmas travas. Lá a placa sobra, então elas são o limite inteiro.
+
+## `VICTORY_EXACT_SPLIT` (acertos com trava compartilhada, buffer criado fora da trava), 27/11 à noite
+Commit `cecc179` na `test/smallram-night`. Uma rodada com `-SmallRam` e `VICTORY_AB=30,VICTORY_EXACT_SPLIT`: a chave alterna a cada 30 s no mesmo jogo, começando no mundo aberto. Contam só as fases com mais de 1.500 draws.
+
+| | Ligada (10 fases, 2.172 quadros) | Desligada (11 fases, 2.188 quadros) |
+|---|---|---|
+| Quadro, mediana das fases | 135,0 ms | 139,2 ms |
+| Quadro, média | 142,3 ms | 149,2 ms |
+| p90 | 225,7 ms | 213,0 ms |
+| Draws por quadro | 7.576 | 7.354 |
+
+**Pares de fases vizinhas (19):** a chave ligada ganha em 12, por 7,5 ms de mediana e 3,8 ms de média.
+
+**Leitura:**
+- O ganho é real, mas pequeno: 3 a 5%, com o p90 um pouco pior.
+- Duas threads criando a mesma cópia ao mesmo tempo quase não acontece no jogo (~0 por quadro); o teste sintético, com 8 threads e as mesmas views, teve 115 em 3.200.
+- Os acertos esperando atrás da criação de buffer não eram o grosso da espera. O que resta deve ser a escrita de cada miss e a varredura, agravadas quando quem segura a trava para numa falta de página (máquina B paginando).
+- A chave fica no kit nvidia desta branch. A próxima medida da trava é uma linha do tempo com ela ligada, para ver quem segura a trava escrita.
+
+**Na mesma rodada, as texturas pretas:**
+- A VRAM estava a 98% do orçamento (6.412 de ~6.530 MB), e o log disse 31 vezes que a placa não tinha espaço para texturas novas.
+- Ficaram 19.375 texturas na fila, subindo a só 27 por segundo (6 MB/s) no mundo.
+- Parte da VRAM é das janelas que o `-SmallRam` põe na placa (`VICTORY_WINDOWS_BAR_MB=1536`; ~0,74 GB na abertura de diagnóstico). Elas entram no carregamento, com a VRAM ainda folgada, e depois ocupam o lugar das texturas do mundo.
+
+  **Próximo teste:** `-SmallRam` com `VICTORY_WINDOWS_BAR_MB=0`. As janelas voltam à RAM; a memória compartilhada estava em 4,5 de 7,4 GB, e o freio protege.
+- A pressão de RAM do `residency.rs` ligou no quadro 45 (2,86 GB livres) e não desligou mais, porque para desligar exige 5 GB livres. Num PC de 16 GB ela fica ligada a sessão inteira, mas o envio real ficou muito abaixo do teto de 64 MB por quadro. Não é ela que segura as texturas.
