@@ -89,6 +89,12 @@ if ($Route -eq 'amd') {
         # DRAW_QUICK: slots that already hold the resource skip the AddRef/Release (A/B:
         # median -1 to -4 ms, mean -5 to -10 ms in the heavy phases).
         VICTORY_DRAW_QUICK = '1'
+        # Ray tracing on by default (27/11: the title's lighting runs; ~7-11 fps on an
+        # RTX 4080). COMPUTE_WAIT=0: the first frame of the world compiled ~13 RT compute
+        # programs one by one without a limit and the title's own 30 s watchdog fired.
+        # Warm the cache with these switches on (victory shaders + victory warm --used).
+        VICTORY_BVH_BUILDER = '1'; VICTORY_RAYS = '1'; VICTORY_BVH_QUARANTINE = '1'
+        VICTORY_PIPELINE_COMPUTE_WAIT = '0'
     }
     if ($LowMemory) {
         # Play-VIctory-4GB.cmd: the estimate (not the constant), the guard at its
