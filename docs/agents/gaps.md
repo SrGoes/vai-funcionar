@@ -5,14 +5,15 @@ Os defeitos vistos jogando estão numerados em `relatos.md`; aqui ficam as causa
 ## Imagem
 | Lacuna | Régua | O que se sabe | Teste que decide | Conserto provável | Issue |
 |---|---|---|---|---|---|
-| Retângulos na água e um no céu | bloqueia | Continuam com luz constante e com ou sem os consertos. A lista de programas que liga `scene_kernel` (`emit/mod.rs:625-640`) força a forma wide aproximada em seis programas, dois deles da volumetria da água. Outros forks veem a água limpa sem isso | `VICTORY_WAVE_WIDE=0` (esfria o cache) | Forma paired do fxceless | #11 |
-| Vegetação piscando ao andar | bloqueia | Não reproduzida com câmera parada. Reserva de tabelas descartada (0 recusadas). Os culls de árvore estão na mesma lista | O mesmo teste, com giro de câmera | O mesmo | |
-| Braço e escada pretos ao mover | bloqueia | ~12 mil texturas na fila de envio; a rota nvidia põe `VICTORY_TEXTURE_NO_WAIT=1` e `VICTORY_UPLOAD_AHEAD=1` | Cada chave em 0, com giro | Esperar a textura só para o que está perto | #7 |
-| Sombras erradas | bloqueia | Vista uma vez (metade da tela escura). Não investigada | Captura com giro e leitura dos draws descartados | | |
+| Retângulos na água e um no céu | bloqueia | Continuam com luz constante e com ou sem os consertos. A lista de programas que liga `scene_kernel` (`emit/mod.rs:625-640`) força a forma wide aproximada em seis programas, dois deles da volumetria da água. Outros forks veem a água limpa sem isso | `VICTORY_WAVE_WIDE=0` (esfria o cache) | Forma paired do fxceless | #36, #11 |
+| Vegetação piscando ao andar | bloqueia | Não reproduzida com câmera parada. Reserva de tabelas descartada (0 recusadas). Os culls de árvore estão na mesma lista | O mesmo teste, com giro de câmera | O mesmo | #40 |
+| Braço e escada pretos ao mover | bloqueia | ~12 mil texturas na fila de envio; a rota nvidia põe `VICTORY_TEXTURE_NO_WAIT=1` e `VICTORY_UPLOAD_AHEAD=1` | Cada chave em 0, com giro | Esperar a textura só para o que está perto | #7, #38 |
+| Sombras erradas | bloqueia | Vista uma vez (metade da tela escura). Não investigada | Captura com giro e leitura dos draws descartados | | #39 |
 | Imagem chapada, sem luz local | degrada (bloqueia no escuro) | A iluminação do jogo fica de fora: ~900 execuções por quadro; entra uma constante | `VICTORY_BVH_BUILDER=1` depois do passo 0 | Construtor de ray tracing em grupos de 32, ou DXR | #14 |
 | Borrão em vegetação, barba e cabelo ao mexer a câmera | degrada | A 10 FPS a reconstrução temporal mistura quadros a 100 ms; o upscaler do jogo é recusado pelo port | Rever com FPS mais alto | | #12 |
 | Flash vermelho | ? | Visto uma vez, sem captura | Captura em rajada | | |
-| Pele, tatuagem, braço cinza, rosto sem superfície | bloqueia | Não vistos na rota nvidia em Series S nas últimas sessões; sem conserto limpo em nenhum fork | `VICTORY_DUMP_BAKES=1` quando reaparecer | | #4, #5, #6, #8 |
+| Pele, tatuagem, braço cinza, rosto sem superfície | bloqueia | Vistos de novo em 27/11: NPC com a cabeça preta (R03, #38) e rosto coberto de ruído (R04, #5). Sem conserto limpo em nenhum fork | `VICTORY_DUMP_BAKES=1` quando reaparecer | | #4, #5, #6, #8 |
+| Debaixo d'água tudo preto | bloqueia | Visto em 27/11 (R02). Mesma suspeita da água | `VICTORY_WAVE_WIDE=0` mergulhando; draws descartados debaixo d'água | Forma paired do fxceless | #37 |
 
 ## Tradutor
 | Lacuna | O que se sabe | Próximo passo | Issue |
