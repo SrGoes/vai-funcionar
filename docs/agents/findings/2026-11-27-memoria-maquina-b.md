@@ -86,3 +86,57 @@ Na rodada longa os heaps do processo foram de 2,6 para 3,4 GB, em linha reta. Um
 5. **Heaps do processo:** comparar "our own allocations" ao longo de uma sessão para saber se o crescimento é nosso.
 
 **Expectativa, não medida:** cada GB tirado do grupo compartilhado é ~1 GB a mais de RAM para o jogo, que hoje tem ~1 GB dos seus ~10 GB na memória. Tirar as janelas (3-5 GB) muda a ordem de grandeza da paginação. É o que mais pode render nesta máquina, mais do que qualquer trava.
+
+## Resultado da abertura de diagnóstico (27/11, 16:09-16:29, `-SmallRam`)
+
+Uma rodada, quase toda em menus e cutscenes (o jogador pausou). Os números valem para esta máquina e este trecho.
+
+**A sonda (`VICTORY_INPLACE_PROBE=1`, driver 621.40):** ler a memória do jogo no lugar **funciona** na RTX 5060.
+- Memória privada aberta inteira ou em parte: leitura e escrita pela placa ok.
+- Seção comprometida aberta por file mapping: leitura e escrita ok, mesmo com a view desmapeada ou protegida.
+- **Seção reservada: recusada** (`0x80070057`), que é o caso do pool de páginas hoje.
+- **Custo de leitura pela placa: igual ao de hoje.** A placa copia 64 MB da memória no lugar em 5,3-5,5 ms, contra 5,4 ms de um buffer compartilhado do tipo atual.
+- Abrir memória privada trava as páginas na RAM (64 MB entraram no conjunto de trabalho). A seção comprometida só entra quando a placa lê.
+
+**O censo (aos 5, 10 e 15 min):** as janelas, em quase toda a sua maior parte, **não podem** ir para o lugar sem cópia.
+
+| Janelas fora de buffers | 5 min | 15 min |
+|---|---|---|
+| Total | 583 janelas, 2.404 MB | 821 janelas, 3.424 MB |
+| Privada inteira (o `VICTORY_INPLACE=1` cobre) | 76, 364 MB | 78, 368 MB |
+| Memória de view com páginas desmapeadas | 249, 1.008 MB | 576, 2.376 MB |
+| Privada não inteira, ou guardada | 255, 1.020 MB | 142, 568 MB |
+| Uma tira contígua de uma seção | 0 | 0 |
+
+**Por que:** o jogo mapeia a memória física **uma página de 64 KB por vez**. São 57 a 85 mil views das páginas do jogo, todas de uma página, exceto 6. Uma janela de 4 MB cobre dezenas de views espalhadas, com buracos no meio. Comprometer o pool não muda isso. Abrir cada view como heap daria um heap por página, sem um buffer contínuo, e mapear blocos de páginas (tile mappings) num heap desses derruba o dispositivo.
+
+Os buffers do jogo, para comparação, somam 756 MB: 252 privados inteiros, 230 numa tira contígua (abríveis com o pool comprometido) e 273 espalhados.
+
+**Conclusão:** ler no lugar sem cópia tiraria no máximo ~0,4 GB de janelas (`VICTORY_INPLACE=1`). Com buffers (`=2`) e pool comprometido, até ~0,9 GB. Não os 3-5 GB esperados. O item 3 do plano cai.
+
+**Os 8 GB write-combined: a maior parte é VRAM, não RAM.** Em 37 mapas de memória, o número de grupos write-combined de 64 MB acompanha os blocos do pool:
+- é sempre a soma dos blocos de texturas (45-46), mais os blocos de staging (3 a 26), mais ~16 constantes;
+- exemplos: 89 = 46 + 26 + 17, e 64 = 45 + 3 + 16;
+- só ~0,65 GB dos 7,3 GB aparece na RAM do processo.
+
+**Inferência:** com o Resizable BAR (a placa aceita `GPU_UPLOAD`), o driver mapeia os heaps de textura da VRAM no espaço de endereços do processo como write-combined. Eles contam no mapa de memória, mas não ocupam RAM. Esses 8 GB não são o que procurar.
+
+**Quem segura os recursos D3D12 (`VICTORY_BOOK_SUMMARY`, 19:28):** 6,0 GB em 17 mil recursos vivos.
+
+| Grupo | Tamanho | Onde fica |
+|---|---|---|
+| Janelas (`title memory`) | 2,5 GB (610) | RAM compartilhada |
+| Buffers do jogo | 0,9 GB (3.488) | — |
+| Janelas na VRAM pelo BAR (`mapped on the card`) | 0,74 GB (175) | VRAM |
+| Buffers do jogo na placa | 0,5 GB (1.193) | — |
+| Envios das submissões (`send.rs`) | 0,48 GB (22) | — |
+| Staging | 0,26 GB (4) | — |
+| Lotes indiretos | 0,16 GB (2.636) | — |
+
+**Paginação:** em 211 amostras, mediana de 2.947 páginas lidas por segundo e pico de 137 mil. A RAM livre ficou em 830 MB de mediana, chegando a 15 MB. É menos que na rodada da linha do tempo (9.644), porque esta ficou mais em menu.
+
+## Plano revisto
+1. **`VICTORY_INPLACE=1`** (só chave): ~0,4 GB de janelas sem cópia, sem custo de leitura medido. Medir o grupo compartilhado e a paginação no mundo.
+2. **Janelas na VRAM:** é para onde ainda dá para mover os ~2,5 GB de janelas que ficam na RAM. Hoje a porta (`VICTORY_WINDOWS_BAR_MB`) só aceita janelas com a placa abaixo de 80% do orçamento, e com `-SmallRam` ela fica perto de 95%. Uma troca a medir: `VICTORY_TEXTURE_MAX=512` libera VRAM para as janelas, ao preço de textura menor. É troca de imagem por memória, e a decisão vai ao Bruno.
+3. **Heaps do processo:** 3,3 GB e crescendo ~25 MB/min. Achar de quem é com "our own allocations" ao longo de uma sessão longa.
+4. **O que o jogo vê de si mesmo:** o `XMemGetWorkingSetStatistics` dá ao jogo o commit do processo inteiro (aqui ~19-21 GB, contra o limite de 7,8 GB do Series S). Registrar o que ele faz depois dessa chamada.
