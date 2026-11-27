@@ -5682,6 +5682,12 @@ impl<T> Spares<T> {
     }
 
     /// One of `width` bytes whose submission is among the `finished`.
+    /// Everything kept, emptied.
+    fn drain(&mut self) -> Vec<(T, u64)> {
+        self.bytes = 0;
+        std::mem::take(&mut self.by_width).into_values().flatten().collect()
+    }
+
     fn take(&mut self, width: u64, finished: u64) -> Option<T> {
         let items = self.by_width.get_mut(&width)?;
         let at = items.iter().position(|(_, after)| *after <= finished)?;
@@ -5705,6 +5711,17 @@ unsafe impl Send for Spare {}
 
 /// The buffers of the copies [`exact`] let go ([`exact_reuse`]).
 static EXACT_SPARE: Mutex<Spares<Spare>> = Mutex::new(Spares::new());
+
+/// Lets go of the buffers [`exact`] keeps for copies to come, while host
+/// memory is pressured (`crate::residency::pressured`, as the host's spare
+/// scratch chunks are). Each is dropped once the submissions that may still
+/// use it have finished.
+pub(crate) fn let_go_spare_views() {
+    let freed = EXACT_SPARE.lock().unwrap_or_else(|e| e.into_inner()).drain();
+    for (spare, _) in freed {
+        crate::host::retire_resource(spare.buffer);
+    }
+}
 
 /// A copy of the title memory `[address, address + len)` that starts at
 /// `address` itself: for a buffer view whose bytes do not start on an
@@ -5746,10 +5763,11 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         return Some(shadow.clone());
     }
     if map.len() >= MANY {
-        // Held by the map alone (no list), its buffer by the copy alone (no
-        // slot shows it), and not asked for lately.
-        // Whatever a list recorded with one of them is in a submission
-        // begun by now: its buffer waits for those to finish.
+        // Held by the map alone, and its buffer by the copy alone (no slot
+        // shows it), and not asked for lately. A list not yet sent holds the
+        // copy (its `Arc`), and that keeps it here; one let go was at most in
+        // lists sent by now, in submissions begun already. Its buffer waits
+        // for those to finish.
         let after = crate::host::submissions().0;
         let mut spares = exact_reuse().then(|| EXACT_SPARE.lock().unwrap_or_else(|e| e.into_inner()));
         map.retain(|_, (shadow, used)| {
@@ -5837,22 +5855,29 @@ mod exact_tests {
         assert_eq!(spares.take(256, 7), Some('a'));
         assert_eq!(spares.bytes, 0);
         assert!(spares.by_width.is_empty());
+        spares.put(256, 'd', 0, 1024);
+        spares.put(512, 'e', 0, 1024);
+        assert_eq!(spares.drain().len(), 2);
+        assert_eq!((spares.bytes, spares.by_width.len()), (0, 0));
     }
 
     /// Views at ring positions: as many copies every frame, none where one
     /// was before. Their buffers are those the copies of two frames before
     /// let go, and read zeros until refreshed. (On main b2184b1 every copy
-    /// made a buffer: 2,400 here.)
+    /// made a buffer: 2,400 here.) Needs a host GPU: without one it says it
+    /// was skipped and passes, which covers nothing. Counts globally: run
+    /// with `--test-threads=1`.
     #[test]
-    fn copies_of_views_at_new_places_take_the_buffers_let_go() {
+    fn gpu_copies_of_views_at_new_places_take_the_buffers_let_go() {
         if host().is_none() {
-            return; // no host GPU here
+            eprintln!("skipped: no host GPU here");
+            return;
         }
         const FRAMES: u64 = 8;
         const VIEWS: u64 = 300;
         let memory = vec![0u64; 1 << 17];
         let start = (memory.as_ptr() as u64).next_multiple_of(4096);
-        let before = EXACT_STATS[1].load(Relaxed);
+        let before = [1, 2].map(|i| EXACT_STATS[i].load(Relaxed));
         for frame in 0..FRAMES {
             let held: Vec<_> = (0..VIEWS)
                 .map(|i| {
@@ -5868,12 +5893,13 @@ mod exact_tests {
                 .collect();
             drop(held);
         }
-        let made = EXACT_STATS[1].load(Relaxed) - before;
-        assert!(
-            made * 2 < FRAMES * VIEWS,
-            "{made} buffers made for {} copies: those let go were not taken",
-            FRAMES * VIEWS
-        );
+        let [made, reused] = [1, 2].map(|i| EXACT_STATS[i].load(Relaxed) - before[i - 1]);
+        eprintln!("{} copies: {made} buffers made, {reused} taken from those let go", FRAMES * VIEWS);
+        assert_eq!(made + reused, FRAMES * VIEWS, "every copy is new");
+        assert!(reused > 0, "no buffer let go was taken");
+        // The copies are kept for 512 askings and looked over from 256 on:
+        // some 2 frames' worth are made before the first ones go.
+        assert!(made <= 3 * VIEWS, "{made} buffers made: those let go were not taken");
     }
 }
 
