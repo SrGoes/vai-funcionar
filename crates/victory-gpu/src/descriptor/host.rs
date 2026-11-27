@@ -1691,7 +1691,11 @@ impl HostHeap {
         let extra = if sampler { 0 } else { dynamic_slots(count, null) };
         // A title heap a capped host heap (NVIDIA) does not hold whole gives
         // up its upper slots, a ring of per-draw tables, for dynamic ones.
-        let extra = if null != 0 && null < PORTABLE_VIEWS && count + extra > null {
+        // View heaps only: here a sampler heap's null slot is 2,047 (not 0, as
+        // where this came from), and a title sampler heap of 2,048 took this
+        // branch, got 262,144 dynamic slots it never uses, and spent the log
+        // line on a sum that wrapped.
+        let extra = if !sampler && null != 0 && null < PORTABLE_VIEWS && count + extra > null {
             let dynamic = capped_dynamic_slots(count, null, dynamic_slots_set());
             static SAID: std::sync::Once = std::sync::Once::new();
             SAID.call_once(|| {
@@ -5425,6 +5429,9 @@ mod tests {
         // SAFETY: live heap query.
         assert_eq!(unsafe { full.heap.GetDesc().NumDescriptors }, 2048);
         assert_eq!(full.count, 2047);
+        // A full title sampler heap is not a capped view heap: no dynamic
+        // slots (a sampler table is never made afresh).
+        assert_eq!((small.dynamic, full.dynamic), (0, 0));
     }
 
     /// A view of a host copy that begins at a later level shows the same
