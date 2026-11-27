@@ -9,14 +9,16 @@ Sem imagens: capturas do jogo não vão para o repositório. Descreva a cena.
 ## Playtest de 27/11/2026
 Código do PR #34 (`eeba481`, build release), kit da rota nvidia com perfil de console Series S, RTX 4080 16 GB, 32 GB de RAM, Windows 10. FPS no título da janela: 8 a 17 no mundo, com 4,5 a 7,5 mil draws por quadro.
 
+Esse build ainda tinha o defeito do heap de samplers consertado depois em `413bbc0`. Pela leitura do código ele não tocava a amostragem de texturas (nenhuma tabela dinâmica de sampler é criada), então não explica R03 nem R04; a confirmação no jogo fica para a próxima rodada.
+
 | Nº | O que se vê | Onde | Régua | Suspeita (hipótese, não provada) | Teste que decide | Issue | Estado |
 |---|---|---|---|---|---|---|---|
-| R01 | Retângulos pretos horizontais na água | Píer, à noite | bloqueia | Os dois programas de volumetria da água rodam na forma wide aproximada | `VICTORY_WAVE_WIDE=0`, com giro de câmera | #11 | aberto |
-| R02 | Debaixo d'água a tela fica toda preta; só a interface aparece | Mergulho junto ao píer | bloqueia | A mesma volumetria da água (transmissão), ou um dos três computes de tela inteira sem tradução | O mesmo teste do R01, mergulhando; ler os draws descartados debaixo d'água | | aberto |
-| R03 | NPC com a cabeça inteira preta; corpo e roupa certos | Posto de gasolina, à noite | bloqueia | Textura de pele da cabeça ainda na fila de envio (`VICTORY_TEXTURE_NO_WAIT=1`) ou bake de pele descartado | `VICTORY_TEXTURE_NO_WAIT=0`; `VICTORY_DUMP_BAKES=1` | #4 | aberto |
+| R01 | Retângulos pretos horizontais na água | Píer, à noite | bloqueia | Os dois programas de volumetria da água rodam na forma wide aproximada | `VICTORY_WAVE_WIDE=0`, com giro de câmera | #36, #11 | aberto |
+| R02 | Debaixo d'água a tela fica toda preta; só a interface aparece | Mergulho junto ao píer | bloqueia | A mesma volumetria da água (transmissão), ou um dos três computes de tela inteira sem tradução | O mesmo teste do R01, mergulhando; ler os draws descartados debaixo d'água | #37 | aberto |
+| R03 | NPC com a cabeça inteira preta; corpo e roupa certos | Posto de gasolina, à noite | bloqueia | Textura de pele da cabeça ainda na fila de envio (`VICTORY_TEXTURE_NO_WAIT=1`) ou bake de pele descartado | `VICTORY_TEXTURE_NO_WAIT=0`; `VICTORY_DUMP_BAKES=1` | #38, #4 | aberto |
 | R04 | Rosto de NPC coberto de ruído vermelho quadriculado; cabelo e corpo certos | Lanchonete do posto | bloqueia | Bake de pele lendo as fontes erradas, ou níveis grandes da textura lendo o vizinho | `VICTORY_DUMP_BAKES=1`; portar o bake de pele ou `VICTORY_PACKED_LEVELS` do fxceless | #5 | aberto |
-| R05 | Manchas pretas grandes no chão e na vegetação; metade da cena sem luz | Quintal junto à água, à noite | bloqueia | Sombras ou luz por blocos de tela vindas de um compute sem tradução ou na forma wide | `VICTORY_WAVE_WIDE=0`; ler os draws descartados na cena | | aberto |
-| R06 | Vegetação e árvores piscando ao andar | Várias | bloqueia | Culls de árvore na forma wide. Reserva de tabelas descartada (0 recusadas) | `VICTORY_WAVE_WIDE=0`, com giro de câmera | | aberto |
+| R05 | Manchas pretas grandes no chão e na vegetação; metade da cena sem luz | Quintal junto à água, à noite | bloqueia | Sombras ou luz por blocos de tela vindas de um compute sem tradução ou na forma wide | `VICTORY_WAVE_WIDE=0`; ler os draws descartados na cena | #39 | aberto |
+| R06 | Vegetação e árvores piscando ao andar | Várias | bloqueia | Culls de árvore na forma wide. Reserva de tabelas descartada (0 recusadas) | `VICTORY_WAVE_WIDE=0`, com giro de câmera | #40 | aberto |
 | R07 | Um braço e uma escada ficam pretos ao mover a câmera | Casa inicial | bloqueia | Textura na fila de envio (`VICTORY_TEXTURE_NO_WAIT=1`, `VICTORY_UPLOAD_AHEAD=1`) | Cada chave em 0 | #7 | aberto |
 | R08 | Imagem chapada, sem luz local; lâmpada acesa não ilumina o chão | Deque da casa, à noite | degrada (bloqueia no escuro) | A iluminação do jogo não roda: ~900 execuções de ray tracing por quadro ficam de fora | `VICTORY_BVH_BUILDER=1` depois de traduzir o construtor para grupos de 32 | #14 | aberto |
 | R09 | Véu cinza sobre a imagem inteira em interior | Lanchonete do posto | degrada | Luz substituta constante somada ao ar (`VICTORY_AMBIENT_AIR=1.5`) | `VICTORY_AMBIENT_AIR` em outros valores, mesma cena | #14 | aberto |
