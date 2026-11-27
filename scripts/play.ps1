@@ -4,6 +4,15 @@
 #               (the kit of Play-VIctory.cmd, the route tested on GeForce cards). Measure and play
 #               on the route of your card: the two kits give different pictures and frame rates.
 # -LowMemory    with -Route nvidia: the kit of Play-VIctory-4GB.cmd (4 GB cards, 16 GB of RAM)
+# -SmallRam     with -Route nvidia: for a PC of 16 GB of RAM (Play-VIctory-16GB.cmd). Windows
+#               gives the card half the RAM as shared memory (7.4 GB there); the port's windows
+#               of title memory (~5 GB) and the staging of a loading world went past it, upload
+#               buffers failed and the driver crashed closing a list (RTX 5060, 27/11, three runs
+#               at 7-11 min). This keeps it under: 1280x720 output with the title's own upscaler
+#               (FidelityFX divides by zero below 1080p on Series S), textures at most 1024
+#               texels a side, windows in the card's memory while it has room, hair on, the
+#               defrag (#46) left out until its picture is checked. Reached the open world
+#               (boat chase) at 7-10 fps with shared memory at 5.6-5.8 GB.
 # -Safe         without the newer, faster ways (the first thing to try when something is wrong)
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
 # -Build        target\diag (the default, the build all measurements are of) or target\release
@@ -29,6 +38,7 @@ param(
     [Parameter(Mandatory)][string]$Exe,
     [ValidateSet('amd', 'nvidia')][string]$Route = 'amd',
     [switch]$LowMemory,
+    [switch]$SmallRam,
     [switch]$Safe,
     [switch]$RayTracing,
     [switch]$UploadAhead,
@@ -41,6 +51,7 @@ param(
     [switch]$DryRun
 )
 if ($LowMemory -and $Route -ne 'nvidia') { Write-Host '-LowMemory is a variant of -Route nvidia.'; exit 2 }
+if ($SmallRam -and $Route -ne 'nvidia') { Write-Host '-SmallRam is a variant of -Route nvidia.'; exit 2 }
 
 if ($Route -eq 'amd') {
     $settings = @{
@@ -86,6 +97,12 @@ if ($Route -eq 'amd') {
         $settings.Remove('VICTORY_TEXTURE_GUARD')
         $settings.VICTORY_CARD_BUFFERS_MIN_KB = '4096'; $settings.VICTORY_CARD_BUFFERS_MB = '256'
         $settings.VICTORY_D3D12_BACKGROUND = '0'
+    }
+    if ($SmallRam) {
+        # See -SmallRam above.
+        $settings.VICTORY_OUTPUT = '1280x720'; $settings.VICTORY_UPSCALER = '6'
+        $settings.VICTORY_TEXTURE_MAX = '1024'; $settings.VICTORY_WINDOWS_BAR_MB = '1536'
+        $settings.VICTORY_HAIR = '1'; $settings.VICTORY_SKIP_PIPELINES = '02384a60fda6f2d0'
     }
     if ($Safe) { $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0' }
 }
