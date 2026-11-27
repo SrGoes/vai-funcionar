@@ -95,6 +95,9 @@ if ($Route -eq 'amd') {
         # Warm the cache with these switches on (victory shaders + victory warm --used).
         VICTORY_BVH_BUILDER = '1'; VICTORY_RAYS = '1'; VICTORY_BVH_QUARANTINE = '1'
         VICTORY_PIPELINE_COMPUTE_WAIT = '0'
+        # Hair on by default: without it people are drawn bald (the hair programs are
+        # among ~1,800 shaders skipped a frame). 27/11: no frame-rate cost seen.
+        VICTORY_HAIR = '1'
     }
     if ($LowMemory) {
         # Play-VIctory-4GB.cmd: the estimate (not the constant), the guard at its
