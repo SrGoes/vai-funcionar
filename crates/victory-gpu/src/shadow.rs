@@ -5655,6 +5655,48 @@ fn exact_lazy() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_EXACT_LAZY").is_ok_and(|v| v.trim() == "1"))
 }
 
+/// Whether [`exact`] lets go of `EXACT` while it makes a buffer for a miss
+/// (`VICTORY_EXACT_UNLOCKED=1`; off by default). The buffer's creation and
+/// residency wait for the card (about 250 us, up to a second) and the title's
+/// recording threads queue behind them.
+fn exact_unlocked() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_EXACT_UNLOCKED") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_EXACT_UNLOCKED").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Whether [`exact`] makes its buffers in steps of 64 KiB instead of 256 bytes
+/// (`VICTORY_EXACT_WIDE=1`; off by default), so that one let go fits nearly
+/// any copy. The card gives a buffer 64 KiB of memory either way.
+fn exact_wide() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_EXACT_WIDE") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_EXACT_WIDE").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// The bytes of the buffer for a copy of `len` bytes. No view sees past
+/// `len` (they begin at its start and count its bytes, `buffer_srv`), and
+/// only `len` rounded up to 256 is zeroed; the rest is left as it was.
+fn exact_width(len: u64, wide: bool) -> u64 {
+    len.next_multiple_of(if wide { 64 << 10 } else { 256 })
+}
+
+/// Two threads each made a buffer for one key while `EXACT` was let go:
+/// `Ok(made)`: none was kept, `made` is kept. `Err((kept, made))`: `kept` stays
+/// and `made` goes back to the spares (the card never saw it).
+fn settle<K, M>(kept: Option<K>, made: M) -> Result<M, (K, M)> {
+    match kept {
+        Some(kept) => Err((kept, made)),
+        None => Ok(made),
+    }
+}
+
 /// Misses between two looks for idle copies when lazy.
 const LAZY_MISSES: u64 = 64;
 
@@ -5773,12 +5815,21 @@ pub(crate) fn let_go_spare_views() {
 /// change every frame), and the next copy of as many bytes takes the buffer
 /// of one that went, zeroed as a new one is ([`exact_reuse`]).
 pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    exact_with(address, len, exact_unlocked(), exact_wide())
+}
+
+/// [`exact`] with its two switches given: `unlocked` ([`exact_unlocked`]) and
+/// `wide` ([`exact_wide`]).
+fn exact_with(address: u64, len: u64, unlocked: bool, wide: bool) -> Option<Arc<Shadow>> {
     /// The askings an idle copy stays for.
     const LATELY: u64 = 512;
     /// The largest, and no view the title made on purpose: off its dwords.
     const MOST: u64 = 64 << 20;
-    /// The most bytes of buffers let go that wait for a copy to take them.
+    /// The most bytes of buffers let go that wait for a copy to take them
+    /// (wide: as many buffers, each 256 times the width).
     const SPARE_MOST: u64 = 64 << 20;
+    const SPARE_MOST_WIDE: u64 = 1024 << 20;
+    let spare_most = if wide { SPARE_MOST_WIDE } else { SPARE_MOST };
     if len == 0 || len > MOST || !address.is_multiple_of(4) {
         return None;
     }
@@ -5808,33 +5859,69 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
                 *used + LATELY > now || Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1;
             if !keep && let Some(spares) = &mut spares {
                 let spare = Spare { buffer: shadow.buffer.clone(), data: shadow.data as usize };
-                spares.put(shadow.width(), spare, after, SPARE_MOST);
+                spares.put(shadow.width(), spare, after, spare_most);
             }
             keep
         });
     }
-    let width = len.next_multiple_of(256);
-    let spare = if exact_reuse() {
-        let finished = crate::host::submissions().1;
-        EXACT_SPARE.lock().unwrap_or_else(|e| e.into_inner()).take(width, finished)
+    let width = exact_width(len, wide);
+    // Brought up to date as a new one is: zeros (no view sees past this).
+    let zeroed = len.next_multiple_of(256);
+    let make = || -> Option<(ID3D12Resource, *mut u8)> {
+        let spare = if exact_reuse() {
+            let finished = crate::host::submissions().1;
+            EXACT_SPARE.lock().unwrap_or_else(|e| e.into_inner()).take(width, finished)
+        } else {
+            None
+        };
+        Some(match spare {
+            Some(spare) => {
+                let data = spare.data as *mut u8;
+                // SAFETY: the mapping of a live buffer of `width` bytes (at
+                // least `zeroed`) that this alone holds: no copy, slot or
+                // list names it.
+                unsafe { std::ptr::write_bytes(data, 0, zeroed as usize) };
+                EXACT_STATS[2].fetch_add(1, Ordering::Relaxed);
+                (spare.buffer, data)
+            }
+            None => {
+                let made = host()?.shared_buffer(width)?;
+                EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
+                made
+            }
+        })
+    };
+    let (buffer, data, mut guard) = if unlocked {
+        drop(guard);
+        let (buffer, data) = make()?;
+        (buffer, data, EXACT.lock().unwrap_or_else(|e| e.into_inner()))
     } else {
-        None
+        let (buffer, data) = make()?;
+        (buffer, data, guard)
     };
-    let (buffer, data) = match spare {
-        Some(spare) => {
-            let data = spare.data as *mut u8;
-            // SAFETY: the mapping of a live buffer of `width` bytes that
-            // this alone holds: no copy, slot or list names it.
-            unsafe { std::ptr::write_bytes(data, 0, width as usize) };
-            EXACT_STATS[2].fetch_add(1, Ordering::Relaxed);
-            (spare.buffer, data)
+    let (tick, map, _) = &mut *guard;
+    let (buffer, data) = if unlocked {
+        // A thread may have made this copy while the lock was let go.
+        let kept = map.get_mut(&(address, len)).map(|(shadow, used)| {
+            *used = *tick;
+            shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+            shadow.clone()
+        });
+        match settle(kept, (buffer, data)) {
+            Ok(made) => made,
+            Err((kept, (buffer, data))) => {
+                // The card never saw this buffer: it waits for the next copy.
+                if exact_reuse() {
+                    let spare = Spare { buffer, data: data as usize };
+                    EXACT_SPARE.lock().unwrap_or_else(|e| e.into_inner()).put(width, spare, 0, spare_most);
+                }
+                return Some(kept);
+            }
         }
-        None => {
-            let made = host()?.shared_buffer(width)?;
-            EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
-            made
-        }
+    } else {
+        (buffer, data)
     };
+    let now = if unlocked { *tick } else { now };
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -5869,7 +5956,7 @@ pub(crate) fn exact_line(frames: f64) {
 mod exact_tests {
     use std::sync::atomic::Ordering::Relaxed;
 
-    use super::{EXACT_STATS, Spares, exact, host, sweep_due};
+    use super::{EXACT_STATS, Spares, exact, exact_width, exact_with, host, settle, sweep_due};
 
     /// The sweep of the copies waits for 64 misses when lazy, but never past
     /// the ceiling; below the first threshold it never runs.
@@ -5914,6 +6001,131 @@ mod exact_tests {
         spares.put(512, 'e', 0, 1024);
         assert_eq!(spares.drain().len(), 2);
         assert_eq!((spares.bytes, spares.by_width.len()), (0, 0));
+    }
+
+    /// Two threads made a buffer for one key: the copy already kept stays, and
+    /// the buffer made after it goes back to the spares; with none kept, the
+    /// new one is kept and nothing goes back.
+    #[test]
+    fn a_lost_race_keeps_the_copy_already_there_and_gives_the_new_buffer_back() {
+        assert_eq!(settle(Some('a'), 'b'), Err(('a', 'b')));
+        assert_eq!(settle(None::<char>, 'b'), Ok('b'));
+    }
+
+    /// A buffer is 256-byte steps wide, or 64 KiB steps wide when asked; the
+    /// spares of the latter are all of one width for views up to 64 KiB.
+    #[test]
+    fn widths_step_by_256_bytes_or_by_64_kib_when_wide() {
+        const STEP: u64 = 64 << 10;
+        for (len, narrow) in [(1, 256), (256, 256), (257, 512), (4_000, 4_096), (STEP, STEP), (STEP + 4, STEP + 256)] {
+            assert_eq!(exact_width(len, false), narrow, "narrow, {len} bytes");
+        }
+        for (len, wide) in [(1, STEP), (128, STEP), (4_000, STEP), (STEP, STEP), (STEP + 4, 2 * STEP), (64 << 20, 64 << 20)] {
+            assert_eq!(exact_width(len, true), wide, "wide, {len} bytes");
+        }
+        // Views of 128, 300 and 4,000 bytes: three widths narrow, one wide.
+        let mut spares = Spares::new();
+        spares.put(exact_width(128, true), 'a', 0, u64::MAX);
+        assert_eq!(spares.take(exact_width(300, true), 0), Some('a'));
+        spares.put(exact_width(300, true), 'b', 0, u64::MAX);
+        assert_eq!(spares.take(exact_width(4_000, true), 0), Some('b'));
+        spares.put(exact_width(128, false), 'c', 0, u64::MAX);
+        assert_eq!(spares.take(exact_width(300, false), 0), None);
+    }
+
+    /// Four threads ask the same keys with `EXACT` let go while buffers are
+    /// made: each key has one copy, the same for all four, that reads zeros.
+    /// Needs a host GPU; global counters, as the test above.
+    #[test]
+    #[ignore = "host GPU and global counters: run alone, --ignored --test-threads=1 (#26)"]
+    fn gpu_unlocked_threads_asking_the_same_keys_share_one_copy_each() {
+        if host().is_none() {
+            eprintln!("skipped: no host GPU here");
+            return;
+        }
+        const KEYS: u64 = 300;
+        const THREADS: usize = 4;
+        let memory = vec![0u64; 1 << 18];
+        let start = (memory.as_ptr() as u64).next_multiple_of(4096);
+        let before = [1, 2].map(|i| EXACT_STATS[i].load(Relaxed));
+        let barrier = std::sync::Barrier::new(THREADS);
+        let held: Vec<Vec<_>> = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        (0..KEYS)
+                            .map(|i| exact_with(start + i * 4_096 + 8, 3_000, true, false).expect("a copy"))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            threads.into_iter().map(|t| t.join().expect("a thread")).collect()
+        });
+        for key in 0..KEYS as usize {
+            for other in &held[1..] {
+                assert!(std::sync::Arc::ptr_eq(&held[0][key], &other[key]), "key {key} has two copies");
+            }
+            // SAFETY: the copy's own mapping, 3,072 bytes.
+            let bytes = unsafe { std::slice::from_raw_parts(held[0][key].data, 3_000) };
+            assert!(bytes.iter().all(|b| *b == 0), "key {key} not zeros");
+        }
+        let [made, reused] = [1, 2].map(|i| EXACT_STATS[i].load(Relaxed) - before[i - 1]);
+        eprintln!("{KEYS} keys, {THREADS} threads: {made} buffers made, {reused} taken from those let go");
+        // A buffer made by the thread that lost goes back and is not counted as a copy.
+        assert!(made + reused >= KEYS, "a key without a buffer");
+        assert!(made + reused <= KEYS * THREADS as u64, "more buffers than askings");
+    }
+
+    /// Copies of views of many sizes in 64 KiB-wide buffers take those let
+    /// go whatever their size; a buffer 64 KiB wide is as much memory as one
+    /// of 256 bytes. Needs a host GPU.
+    #[test]
+    #[ignore = "host GPU and global counters: run alone, --ignored --test-threads=1 (#26)"]
+    fn gpu_wide_copies_of_many_sizes_take_the_buffers_let_go() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let Some(host) = host() else {
+            eprintln!("skipped: no host GPU here");
+            return;
+        };
+        let info = |width: u64| {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Alignment: 0,
+                Width: width,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            // SAFETY: a plain query of the device.
+            unsafe { host.device.GetResourceAllocationInfo(0, &[desc]) }.SizeInBytes
+        };
+        assert_eq!(info(256), info(64 << 10), "a 256-byte buffer takes as much as a wide one");
+        const FRAMES: u64 = 8;
+        const VIEWS: u64 = 300;
+        let memory = vec![0u64; 1 << 20];
+        let start = (memory.as_ptr() as u64).next_multiple_of(4096);
+        let before = [1, 2].map(|i| EXACT_STATS[i].load(Relaxed));
+        for frame in 0..FRAMES {
+            let held: Vec<_> = (0..VIEWS)
+                .map(|i| {
+                    let address = start + (frame * VIEWS + i) * 4_096 + 8;
+                    // Each frame in sizes the frames before had not: narrow, none of
+                    // the buffers let go would fit (all under 64 KiB).
+                    let len = 128 + frame * 4_000 + (i * 13 % 300) * 13;
+                    exact_with(address, len, false, true).expect("a copy")
+                })
+                .collect();
+            drop(held);
+        }
+        let [made, reused] = [1, 2].map(|i| EXACT_STATS[i].load(Relaxed) - before[i - 1]);
+        eprintln!("{} copies: {made} buffers made, {reused} taken from those let go", FRAMES * VIEWS);
+        assert_eq!(made + reused, FRAMES * VIEWS, "every copy is new");
+        assert!(made <= 3 * VIEWS, "{made} buffers made: those let go were not taken");
     }
 
     /// Views at ring positions: as many copies every frame, none where one
