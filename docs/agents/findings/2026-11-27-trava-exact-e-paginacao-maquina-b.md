@@ -169,3 +169,32 @@ Commit `cecc179` na `test/smallram-night`. Uma rodada com `-SmallRam` e `VICTORY
 
   **Próximo teste:** `-SmallRam` com `VICTORY_WINDOWS_BAR_MB=0`. As janelas voltam à RAM; a memória compartilhada estava em 4,5 de 7,4 GB, e o freio protege.
 - A pressão de RAM do `residency.rs` ligou no quadro 45 (2,86 GB livres) e não desligou mais, porque para desligar exige 5 GB livres. Num PC de 16 GB ela fica ligada a sessão inteira, mas o envio real ficou muito abaixo do teto de 64 MB por quadro. Não é ela que segura as texturas.
+
+## Texturas pretas no mundo: a reserva para render targets e as janelas na VRAM (27/11 à noite)
+Mesma branch, rodadas começando no mundo aberto (o save avançou).
+
+**Sintoma:** asfalto, muretas e paredes pretos chapados, enquanto carros, céu, água e árvores saíam normais. A fila de texturas ficou com 13 a 21 mil esperando, e o log dizia que a placa não tinha espaço para texturas novas.
+
+**Causa, em duas partes:**
+1. `room()` (`resource.rs`) soma ao uso da placa uma reserva para render targets que ainda não existem (`targets_room_kept`): `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (3.072 MB) menos o que os targets já ocupam. O número foi medido numa resolução maior. Com a saída de 720p do `-SmallRam`, os targets ocupam ~966 MB, e ~2,1 GB ficavam guardados para targets que não vêm. A fila era recusada com ~1,4 GB da placa livres de verdade (5.101 de 6.502 MB, contra o limite de 90%, ~5.850 MB).
+2. As janelas na VRAM (`VICTORY_WINDOWS_BAR_MB=1536`, ~0,74 GB) entram durante o carregamento e ocupam o lugar das texturas do mundo.
+
+**Mudança no `-SmallRam`:** `VICTORY_WINDOWS_BAR_MB=0` e `VICTORY_CARD_ROOM_FOR_TARGETS_MB=1152` (o que os targets ocupam em 720p, mais folga).
+
+| Uma rodada de cada, ~10-14 min | Antes (janelas na VRAM, reserva de 3 GB) | Depois |
+|---|---|---|
+| Capturas com mais de 20% de pixels quase pretos | 10 de 47 | 2 de 25 |
+| Pixels quase pretos por captura, mediana e média | 3,3% e 14,5% | 1,4% e 6,7% |
+| FPS no mundo, mediana | 6,9 | 6,5 |
+| VRAM, mediana e pico | 6.299 e 6.461 MB | 6.587 e 7.019 MB |
+| Memória compartilhada, mediana e pico | 4.833 e 5.828 MB | 6.146 e **7.170 MB** |
+| Quedas e falhas de upload | 0 e 0 | 0 e 0 |
+
+**Nas capturas:** o asfalto ganhou textura (cinza, faixas de pedestre e marcas), e calçadas, casas e cercas aparecem completas. Na rodada anterior, a mesma rua saía preta. A fila ainda sobe ao trocar de área (pico de 18,5 mil) e desce depois (4,5 mil no mínimo).
+
+**Ressalvas:**
+- A memória compartilhada chegou a 96% do orçamento, e a VRAM passou um pouco do orçamento que o sistema dá. O freio segurou (nenhuma falha de upload, nenhuma queda), mas a margem é fina.
+- Se a queda de memória voltar, os próximos passos são um teto de textura menor (`VICTORY_TEXTURE_MAX=512`), uma reserva de janelas na VRAM só quando sobrar placa, ou soltar as janelas ociosas mais cedo.
+- **Em código, a correção certa é a reserva acompanhar o tamanho dos targets da resolução em uso**, em vez de um número fixo medido noutra resolução.
+
+**A casa escura é outra coisa:** é a luz substituta (`constant:0.8`), com o ray tracing desligado. O asfalto preto do relato R05 / #39 também pode ter uma parte de iluminação: os computes sem tradução `8b437ab6`, `477b52e7` e `17af85f1` caem a cada quadro. Esta rodada mostra que a maior parte era textura que não subia.

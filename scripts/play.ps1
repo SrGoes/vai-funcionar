@@ -116,7 +116,17 @@ if ($Route -eq 'amd') {
     if ($SmallRam) {
         # See -SmallRam above.
         $settings.VICTORY_OUTPUT = '1280x720'; $settings.VICTORY_UPSCALER = '6'
-        $settings.VICTORY_TEXTURE_MAX = '1024'; $settings.VICTORY_WINDOWS_BAR_MB = '1536'
+        $settings.VICTORY_TEXTURE_MAX = '1024'
+        # Textures black in the world (RTX 5060, 27/11): the texture queue was
+        # refused with the card at 98% of its budget. Windows in card memory
+        # (VICTORY_WINDOWS_BAR_MB=1536, ~0.74 GB) took the room the world's
+        # textures need: they stay in the PC's memory (shared went 4.5 -> 6.0 GB
+        # of 7.4). And the room kept for render targets not made yet is 3,072 MB
+        # less what they hold, measured at higher resolutions: at 720p they hold
+        # ~966 MB, so ~2.1 GB stood kept for targets that never came and the
+        # queue was refused with 1.4 GB of the card free. 1,152 MB: what they
+        # hold plus some.
+        $settings.VICTORY_WINDOWS_BAR_MB = '0'; $settings.VICTORY_CARD_ROOM_FOR_TARGETS_MB = '1152'
         $settings.VICTORY_HAIR = '1'; $settings.VICTORY_SKIP_PIPELINES = '02384a60fda6f2d0'
         # Windows of title memory in private memory committed whole are read in
         # place, no copy (~80 windows, ~0.4 GB on an RTX 5060 with 16 GB, 27/11):

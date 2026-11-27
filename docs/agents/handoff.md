@@ -41,6 +41,13 @@ Branch `fix/shared-budget-guard`. Rota nvidia, build de diagnóstico da `main` e
 
   **Próximo passo:** abrir uma vez o build `test/night-smallram` (PR #56 com o PR #57, já compilado) com `-SmallRam` e a linha do tempo nos mesmos horários, para medir o `EXACT_LAZY` aqui. Depois, tirar a criação de buffer de dentro da trava.
 
+## Máquina B, fim de 27/11: o que o `-SmallRam` tem agora e por quê
+- Branch `test/smallram-night`: o PR #56 (kit da madrugada, `EXACT_LAZY`) com o PR #57 e a trava nova `VICTORY_EXACT_SPLIT` (A/B: 3 a 5% mais rápido).
+- No mundo, 7,2 FPS de mediana em 20 minutos, contra 4,9 sem o PR #56.
+- As texturas pretas no mundo eram a reserva para render targets (3.072 MB, medida em resolução maior) somada às janelas na VRAM. O `-SmallRam` agora põe `VICTORY_WINDOWS_BAR_MB=0` e `VICTORY_CARD_ROOM_FOR_TARGETS_MB=1152`. As capturas com mais de 20% de pixels pretos caíram de 21% para 8%, com o FPS igual.
+- A margem ficou fina: a memória compartilhada chegou a 96% do orçamento.
+- Detalhes em `findings/2026-11-27-trava-exact-e-paginacao-maquina-b.md`.
+
 ## Em uma frase
 O port abre e chega ao mundo em placa NVIDIA no Windows 10, a 8-12 FPS e sem o roxo, mas está abaixo dos dois pisos de "jogável": falta FPS, a água tem retângulos, a vegetação pisca ao andar e a iluminação do jogo não roda.
 
