@@ -14,4 +14,5 @@ mod pso;
 pub mod record;
 mod snap;
 mod states;
+pub mod still;
 mod wire;

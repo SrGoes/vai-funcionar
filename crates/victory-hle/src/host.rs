@@ -87,10 +87,12 @@ impl HostPolicy {
                 return Some(ours);
             }
         }
-        // With a timeline asked for, what threads wait with is wrapped.
+        // With a timeline asked for, what threads wait with is wrapped; with
+        // the frame recorder on, sleeps also wait out what it stood still.
         #[cfg(all(windows, feature = "diagnostics"))]
         if let ImportSymbol::Name { name, .. } = symbol {
-            return Some(victory_gpu::timeline::import(name, address));
+            let address = victory_gpu::timeline::import(name, address);
+            return Some(victory_gpu::replay::still::import(name, address));
         }
         Some(address)
     }
