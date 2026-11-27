@@ -5116,10 +5116,15 @@ impl Host {
         }
         let code = code.ok_or_else(windows::core::Error::empty)?;
         let list = || self.make_prelude().ok_or_else(windows::core::Error::empty);
-        // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
-        // in one submission.
-        const RESULTS: u64 = 1 << 20;
-        let (differs, data) = self.shared_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
+        // A megabyte of results by default: 262,144 pieces, 16 GB of declared
+        // ranges in one submission. (Read here, once: the area is not remade,
+        // so `VICTORY_AB` changes how much of it is used, not its size.)
+        #[cfg(feature = "diagnostics")]
+        let ab_named = crate::ab::bit("VICTORY_CARD_RESULTS_MB").is_some();
+        #[cfg(not(feature = "diagnostics"))]
+        let ab_named = false;
+        let results = card_results_bytes(std::env::var("VICTORY_CARD_RESULTS_MB").ok().as_deref(), ab_named);
+        let (differs, data) = self.shared_buffer(results).ok_or_else(windows::core::Error::empty)?;
         name(&differs, || "card compare results".into());
         // SAFETY: the blob's own bytes; the root signature is inside the
         // shader.
@@ -5142,7 +5147,7 @@ impl Host {
                 fetch: list()?,
                 root,
                 pso,
-                differs: (differs, data as usize, RESULTS),
+                differs: (differs, data as usize, results),
                 fetched: None,
                 taken: 0,
                 out: 0,
@@ -5325,6 +5330,7 @@ impl Host {
         };
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
+        let capacity = card_results_capacity(work.differs.2);
         let mut at = work.taken;
         let first_result = at;
         for (shadow, ranges) in &declared {
@@ -5342,7 +5348,7 @@ impl Host {
                 let Some(span) = shadow.card_span(from, to) else {
                     continue;
                 };
-                let compared = twin && u64::from(at + span.pieces) * 4 <= work.differs.2;
+                let compared = twin && card_results_fit(at, span.pieces, capacity);
                 plan.ranges.push(CardRange {
                     shadow: shadow.clone(),
                     declared: (from, to),
@@ -5360,7 +5366,7 @@ impl Host {
             let twin = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
             if let Some(span) = shadow.card_span(*from, from + len)
                 && twin
-                && u64::from(at + span.pieces) * 4 <= work.differs.2
+                && card_results_fit(at, span.pieces, capacity)
             {
                 plan.ranges.push(CardRange {
                     shadow: shadow.clone(),
@@ -5438,7 +5444,7 @@ impl Host {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
-            .is_some_and(|work| u64::from(work.taken) * 8 > work.differs.2)
+            .is_some_and(|work| card_results_full(work.taken, card_results_capacity(work.differs.2)))
     }
 
     /// The plan's submission has run and its results were read
@@ -12918,3 +12924,81 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     }
 }
 
+/// The compare's result area without `VICTORY_CARD_RESULTS_MB`: a megabyte.
+const CARD_RESULTS_DEFAULT: u64 = 1 << 20;
+
+/// Size of the compare's result area in bytes: `VICTORY_CARD_RESULTS_MB` (read once, when
+/// the area is made), else a megabyte. Named in `VICTORY_AB` with no size it is made 4 MiB, so
+/// that the "on" phases have room; the "off" phases keep using a megabyte of it.
+fn card_results_bytes(mb: Option<&str>, ab_named: bool) -> u64 {
+    match mb.and_then(|v| v.trim().parse::<u64>().ok()).filter(|mb| *mb > 0) {
+        Some(mb) => mb.min(64) << 20,
+        None if ab_named => 4 << 20,
+        None => CARD_RESULTS_DEFAULT,
+    }
+}
+
+/// How much of the area made is used now: all of it, except in the "off" phases of
+/// `VICTORY_AB=..,VICTORY_CARD_RESULTS_MB`, which use a megabyte as before.
+fn card_results_capacity(allocated: u64) -> u64 {
+    #[cfg(feature = "diagnostics")]
+    if crate::ab::pick("VICTORY_CARD_RESULTS_MB") == Some(false) {
+        return allocated.min(CARD_RESULTS_DEFAULT);
+    }
+    allocated
+}
+
+/// Whether `pieces` more dwords fit behind the `at` taken ones (a dword is 4 bytes).
+fn card_results_fit(at: u32, pieces: u32, capacity: u64) -> bool {
+    (u64::from(at) + u64::from(pieces)) * 4 <= capacity
+}
+
+/// Whether more than half of the area is taken (`taken` in dwords): the submitting thread
+/// then lets the flights land, which frees it.
+fn card_results_full(taken: u32, capacity: u64) -> bool {
+    u64::from(taken) * 8 > capacity
+}
+
+#[cfg(test)]
+mod card_results_tests {
+    use super::*;
+
+    #[test]
+    fn card_results_size_defaults_to_a_megabyte() {
+        assert_eq!(card_results_bytes(None, false), 1 << 20);
+        assert_eq!(card_results_bytes(Some("0"), false), 1 << 20);
+        assert_eq!(card_results_bytes(Some("junk"), false), 1 << 20);
+    }
+
+    #[test]
+    fn card_results_size_follows_the_key_and_is_bounded() {
+        assert_eq!(card_results_bytes(Some("4"), false), 4 << 20);
+        assert_eq!(card_results_bytes(Some(" 2 "), true), 2 << 20);
+        assert_eq!(card_results_bytes(Some("9999"), false), 64 << 20);
+        // Named in VICTORY_AB without a size: the area is made big enough for the "on" phases.
+        assert_eq!(card_results_bytes(None, true), 4 << 20);
+    }
+
+    #[test]
+    fn card_results_wait_when_more_than_half_is_taken() {
+        let capacity = 1 << 20;
+        // taken is in dwords: half of the area is 131,072 of them.
+        assert!(!card_results_full(0, capacity));
+        assert!(!card_results_full(131_072, capacity));
+        assert!(card_results_full(131_073, capacity));
+        // The same plans in the air leave room in a 4 MiB area.
+        assert!(!card_results_full(131_073, 4 << 20));
+        assert!(card_results_full(524_289, 4 << 20));
+    }
+
+    #[test]
+    fn card_results_fit_counts_the_dwords_asked_for() {
+        let capacity = 1 << 20;
+        assert!(card_results_fit(0, 262_144, capacity));
+        assert!(!card_results_fit(0, 262_145, capacity));
+        assert!(card_results_fit(100, 262_044, capacity));
+        assert!(!card_results_fit(100, 262_045, capacity));
+        // No overflow of the dword count near the top of u32.
+        assert!(!card_results_fit(u32::MAX, 1, capacity));
+    }
+}
