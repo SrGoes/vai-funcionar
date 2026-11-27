@@ -4754,6 +4754,28 @@ mod thread_tests {
 /// `stride` bytes apart (no root arguments, so no root signature), made
 /// once.
 fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
+    if !crate::resource::placed_quick() {
+        return host_signature_global(kind, stride);
+    }
+    // The signatures of `MADE` are never dropped: a copy per thread is safe.
+    thread_local! {
+        static HERE: std::cell::RefCell<Vec<((u32, u32), ID3D12CommandSignature)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let found = HERE.try_with(|here| {
+        here.borrow().iter().find(|(k, _)| *k == (kind, stride)).map(|(_, s)| s.clone())
+    });
+    if let Ok(Some(signature)) = found {
+        return Some(signature);
+    }
+    let signature = host_signature_global(kind, stride)?;
+    // A thread going away keeps nothing: it asks the global table next time.
+    let _ = HERE.try_with(|here| here.borrow_mut().push(((kind, stride), signature.clone())));
+    Some(signature)
+}
+
+/// [`host_signature`] under the global lock.
+fn host_signature_global(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> =
         std::sync::Mutex::new(Vec::new());
     let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());

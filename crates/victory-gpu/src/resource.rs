@@ -3219,10 +3219,114 @@ pub(crate) fn texture_held(resource: This) -> Option<(u32, crate::texture::Diges
     *made_copy(resource)?.holds.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Whether the per-thread look-aside in front of [`PLACED_TEXTURES`] and
+/// the host command signatures is used (`VICTORY_PLACED_QUICK=1`; off by
+/// default, A/B-able by that name). Their maps only grow, so a hit is always
+/// what the locked lookup would give.
+#[cfg(windows)]
+pub(crate) fn placed_quick() -> bool {
+    #[cfg(test)]
+    if PLACED_QUICK_IN_TEST.get() {
+        return true;
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        // The bit is read once: `ab::pick` compares names on every call.
+        static BIT: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+        if let Some(bit) = *BIT.get_or_init(|| crate::ab::bit("VICTORY_PLACED_QUICK")) {
+            return crate::ab::on(bit);
+        }
+    }
+    // Read here: the switch of the placed-texture look-aside.
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PLACED_QUICK").is_ok_and(|v| v.trim() == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`placed_quick`], for what this thread does.
+    static PLACED_QUICK_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A thread's direct-mapped memory of what [`texture_at`] answered, by the
+/// address and description as asked (filler words included, so that a hit
+/// has already been through [`PLACED_RAW`]). A slot holds one entry; the
+/// next one hashing to it replaces it.
+#[cfg(windows)]
+struct PlacedQuick {
+    /// `(address, description, resource)`; resource 0 is an empty slot.
+    slots: Vec<(u64, [u32; 14], usize)>,
+}
+
+#[cfg(windows)]
+impl PlacedQuick {
+    const SLOTS: usize = 4096;
+
+    fn new() -> Self {
+        Self::with_slots(Self::SLOTS)
+    }
+
+    fn with_slots(count: usize) -> Self {
+        Self { slots: vec![(0, [0; 14], 0); count] }
+    }
+
+    fn slot(&self, address: u64, desc: &[u32; 14]) -> usize {
+        let hash = desc.iter().fold(address, |h, &w| (h.rotate_left(5) ^ u64::from(w)).wrapping_mul(0x517c_c1b7_2722_0a95));
+        (hash >> 40) as usize % self.slots.len()
+    }
+
+    fn get(&self, address: u64, desc: &[u32; 14]) -> Option<usize> {
+        let (a, d, resource) = &self.slots[self.slot(address, desc)];
+        (*resource != 0 && *a == address && d == desc).then_some(*resource)
+    }
+
+    fn put(&mut self, address: u64, desc: &[u32; 14], resource: usize) {
+        if resource != 0 {
+            let slot = self.slot(address, desc);
+            self.slots[slot] = (address, *desc, resource);
+        }
+    }
+}
+
+/// What `slow` answers for `(address, desc)`, from `quick` when it has
+/// it. The borrow is let go while `slow` runs: it may ask again.
+#[cfg(windows)]
+fn through_quick(
+    quick: &std::cell::RefCell<PlacedQuick>,
+    address: u64,
+    desc: &[u32; 14],
+    slow: impl FnOnce() -> Option<usize>,
+) -> Option<usize> {
+    if let Some(found) = quick.borrow().get(address, desc) {
+        return Some(found);
+    }
+    let made = slow()?;
+    quick.borrow_mut().put(address, desc, made);
+    Some(made)
+}
+
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]
 pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
+    if !placed_quick() {
+        return texture_at_global(address, desc);
+    }
+    thread_local! {
+        static QUICK: std::cell::RefCell<PlacedQuick> = std::cell::RefCell::new(PlacedQuick::new());
+    }
+    // A thread going away has no table any more: ask the global one.
+    let Ok(found) = QUICK.try_with(|quick| {
+        through_quick(quick, address, desc, || texture_at_global(address, desc).map(|r| r as usize))
+    }) else {
+        return texture_at_global(address, desc);
+    };
+    found.map(|r| r as This)
+}
+
+/// [`texture_at`] under the global lock.
+#[cfg(windows)]
+fn texture_at_global(address: u64, desc: &[u32; 14]) -> Option<This> {
     // Words 1 and 13 of the description are the filler of its layout
     // (after the dimension, and at the end): the title leaves there what
     // its stack held, and two views of one texture that differed only in
@@ -3282,6 +3386,123 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         .placed
         .store(true, std::sync::atomic::Ordering::Relaxed);
     Some(out)
+}
+
+#[cfg(all(windows, test))]
+mod placed_quick_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+
+    fn desc(width: u32) -> [u32; 14] {
+        [3, 0, 0, 0, width, 0, 4, 0x1_0001, 67, 1, 0, 0, 0, 0]
+    }
+
+    #[test]
+    fn a_hit_is_what_was_put_and_nothing_else() {
+        let mut quick = PlacedQuick::new();
+        assert_eq!(quick.get(0, &[0; 14]), None, "an empty slot answers nothing");
+        quick.put(0x1000, &desc(4), 7);
+        assert_eq!(quick.get(0x1000, &desc(4)), Some(7));
+        assert_eq!(quick.get(0x1000, &desc(8)), None, "same address, other description");
+        assert_eq!(quick.get(0x2000, &desc(4)), None, "same description, other address");
+        // Filler words are part of what was asked.
+        let mut filled = desc(4);
+        filled[1] = 0xdead;
+        assert_eq!(quick.get(0x1000, &filled), None);
+        quick.put(0x3000, &desc(4), 0);
+        assert_eq!(quick.get(0x3000, &desc(4)), None, "resource 0 is not stored");
+    }
+
+    #[test]
+    fn a_collision_replaces_and_the_old_one_misses() {
+        let mut quick = PlacedQuick::new();
+        let first = 0x1000;
+        let second = (first + 1..).find(|a| quick.slot(*a, &desc(4)) == quick.slot(first, &desc(4))).unwrap();
+        quick.put(first, &desc(4), 1);
+        quick.put(second, &desc(4), 2);
+        assert_eq!(quick.get(second, &desc(4)), Some(2));
+        assert_eq!(quick.get(first, &desc(4)), None);
+    }
+
+    #[test]
+    fn the_same_address_and_slot_with_another_description_misses() {
+        let mut quick = PlacedQuick::new();
+        let address = 0x1000;
+        let other = (5..).map(desc).find(|d| quick.slot(address, d) == quick.slot(address, &desc(4))).unwrap();
+        quick.put(address, &desc(4), 1);
+        assert_eq!(quick.get(address, &other), None);
+        quick.put(address, &other, 2);
+        assert_eq!(quick.get(address, &other), Some(2));
+        assert_eq!(quick.get(address, &desc(4)), None);
+    }
+
+    #[test]
+    fn random_asks_give_what_the_map_gives() {
+        // The map stands for PLACED_TEXTURES: entries are added, never
+        // changed or removed. Few addresses, so that slots collide.
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % bound
+        };
+        // Eight slots for sixty keys: nearly every ask collides.
+        let quick = RefCell::new(PlacedQuick::with_slots(8));
+        let mut map: BTreeMap<(u64, [u32; 14]), usize> = BTreeMap::new();
+        let mut made = 0;
+        for _ in 0..20_000 {
+            let address = 0x1000 + next(6) * 0x1000;
+            let mut asked = desc(4 + next(5) as u32);
+            asked[1] = next(2) as u32;
+            let expected = map.get(&(address, asked)).copied();
+            // Buffers (dimension 1) are never made: a miss every time.
+            let buffer = next(8) == 0;
+            let slow = || match map.get(&(address, asked)) {
+                Some(&r) => Some(r),
+                None if buffer => None,
+                None => {
+                    made += 1;
+                    map.insert((address, asked), made);
+                    Some(made)
+                }
+            };
+            let got = through_quick(&quick, address, &asked, slow);
+            match expected {
+                Some(r) => assert_eq!(got, Some(r)),
+                None if buffer => assert_eq!(got, None),
+                None => assert_eq!(got, map.get(&(address, asked)).copied()),
+            }
+        }
+        // Everything the map holds is answered the same, from either side.
+        for (&(address, asked), &r) in &map {
+            assert_eq!(through_quick(&quick, address, &asked, || map.get(&(address, asked)).copied()), Some(r));
+        }
+    }
+
+    #[test]
+    fn texture_at_gives_the_same_with_the_look_aside_on() {
+        static TITLE_BYTES: [u8; 8192] = [0; 8192];
+        let address = TITLE_BYTES.as_ptr() as u64;
+        let (first, second) = (desc(4), desc(8));
+        PLACED_QUICK_IN_TEST.set(false);
+        let off = (texture_at(address, &first), texture_at(address, &second));
+        PLACED_QUICK_IN_TEST.set(true);
+        let on = (texture_at(address, &first), texture_at(address, &second));
+        let again = (texture_at(address, &first), texture_at(address, &second));
+        PLACED_QUICK_IN_TEST.set(false);
+        assert!(off.0.is_some() && off.1.is_some());
+        assert_ne!(off.0, off.1, "two descriptions, two resources");
+        assert_eq!(on, off);
+        assert_eq!(again, off);
+        // Filler words differ, the texture does not (as without the look-aside).
+        let mut filled = first;
+        filled[1] = 0xdead;
+        PLACED_QUICK_IN_TEST.set(true);
+        assert_eq!(texture_at(address, &filled), off.0);
+        PLACED_QUICK_IN_TEST.set(false);
+    }
 }
 
 /// The resource for an unordered access view of a texture placed at
