@@ -486,6 +486,9 @@ fn by_cause(parts: &[Part], label: &dyn Fn(u32) -> String) -> Vec<(String, u64)>
     sums
 }
 
+/// Addresses of each sampled thread the summary lists.
+const TOP_PLACES: usize = 12;
+
 /// The summary.
 pub(super) fn summary(trace: &Trace, names: &mut Names, stacks: &[[usize; DEPTH]], before: &Threads, after: &Threads) -> String {
     let mut text = String::new();
@@ -657,6 +660,23 @@ pub(super) fn summary(trace: &Trace, names: &mut Names, stacks: &[[usize; DEPTH]
     for (site, (sum, n)) in calls.into_iter().take(25) {
         let _ = writeln!(text, "  {:7.2} ms in {:7.1}  {site}", ms(sum) / frames, n as f64 / frames);
     }
+
+    // Where the sampled threads were: the title's recording threads too.
+    let mut found: BTreeMap<u32, Vec<u64>> = BTreeMap::new();
+    for e in trace.events.iter().filter(|e| e.kind == Kind::Sample && e.a != 0 && e.t0 >= start && e.t0 <= stop) {
+        found.entry(e.thread).or_default().push(e.a);
+    }
+    let mut found: Vec<(u32, Vec<u64>)> = found.into_iter().collect();
+    found.sort_by_key(|f| std::cmp::Reverse(f.1.len()));
+    let _ = writeln!(text, "\nwhere the sampled threads were: the {TOP_PLACES} addresses most found, as module+place in it (for the pdb)");
+    for (thread, addresses) in found {
+        let _ = writeln!(text, "  {}: {} samples", label(thread), addresses.len());
+        for (address, n) in hottest(&addresses, TOP_PLACES) {
+            let (file, at, ours) = Names::module(address as usize);
+            let name = if ours { format!("  {}", names.of(address as usize)) } else { String::new() };
+            let _ = writeln!(text, "    {n:6} {:5.1}%  {file}+{at:#x}{name}", 100.0 * n as f64 / addresses.len() as f64);
+        }
+    }
     text
 }
 
@@ -768,6 +788,19 @@ pub(super) fn chrome(
         }
     }
     writeln!(out, "\n]}}")
+}
+
+/// The `n` addresses most found among `addresses`, each with its count:
+/// most first, equal counts by address.
+fn hottest(addresses: &[u64], n: usize) -> Vec<(u64, u64)> {
+    let mut counts: HashMap<u64, u64> = HashMap::new();
+    for &address in addresses {
+        *counts.entry(address).or_default() += 1;
+    }
+    let mut counts: Vec<(u64, u64)> = counts.into_iter().collect();
+    counts.sort_by_key(|&(address, n)| (std::cmp::Reverse(n), address));
+    counts.truncate(n);
+    counts
 }
 
 /// Writes both files.
@@ -953,5 +986,35 @@ mod tests {
         assert!(json.starts_with(b"{\"traceEvents\""));
         let text = summary(&trace, &mut names, &data.stacks, &Threads::now(), &Threads::now());
         assert!(text.contains("frames in"));
+    }
+
+    #[test]
+    fn the_hottest_addresses_come_most_counted_first() {
+        let found = [0x30, 0x10, 0x30, 0x20, 0x10, 0x30, 0x40, 0x20];
+        assert_eq!(hottest(&found, 3), [(0x30, 3), (0x10, 2), (0x20, 2)]);
+        assert_eq!(hottest(&found, 9).len(), 4);
+        assert!(hottest(&[], 3).is_empty());
+    }
+
+    /// The sampled threads' places are in the text, by thread, with their
+    /// share and where in the module they are.
+    #[test]
+    fn the_summary_tells_where_each_sampled_thread_was() {
+        let here = the_hottest_addresses_come_most_counted_first as *const () as usize as u64;
+        let events = vec![
+            event(Kind::Frame, "present", 1, (1000, 1000), 0, 0),
+            event(Kind::Frame, "present", 1, (2000, 2000), 0, 0),
+            event(Kind::Sample, "a sample", 5, (1100, 1100), here, 0),
+            event(Kind::Sample, "a sample", 5, (1200, 1200), here, 0),
+            event(Kind::Sample, "a sample", 5, (1300, 1300), here, 0),
+            event(Kind::Sample, "a sample", 5, (1400, 1400), here + 4, 0),
+            // Outside the frames, and a failed look: left out.
+            event(Kind::Sample, "a sample", 5, (3000, 3000), here + 8, 0),
+            event(Kind::Sample, "a sample", 5, (1500, 1500), 0, 0),
+        ];
+        let trace = Trace::new(events, &[]);
+        let text = summary(&trace, &mut Names::new(), &[], &Threads::default(), &Threads::default());
+        assert!(text.contains("  5: 4 samples\n"), "{text}");
+        assert!(text.lines().any(|l| l.trim_start().starts_with("3  75.0%") && l.contains("+0x")), "{text}");
     }
 }
