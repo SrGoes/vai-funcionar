@@ -535,6 +535,7 @@ fn sweep() {
     crate::residency::refresh();
     if crate::residency::pressured() {
         trim_spare_chunks();
+        crate::shadow::let_go_spare_views();
     }
     crate::pool::room(host().and_then(|h| h.video_memory()));
     crate::pipeline::trim_library();
