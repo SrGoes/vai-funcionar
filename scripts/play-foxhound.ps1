@@ -98,6 +98,13 @@ $settings = @{
 if (-not $SeriesS) {
     if ($Res -eq '1440') { $settings.VICTORY_NATIVE_1440P = '1' }
     elseif ($Res -eq '1080to1440') { $settings.VICTORY_RENDER_1080P = '1' }
+} else {
+    # The texture queue keeps room for render targets not made yet: 3,072 MB less what they hold, measured at
+    # higher resolutions. At Series S's 1280x720 they hold about 1 GB, so ~2 GB stood kept for targets that never
+    # came: on an RTX 5060 (8 GB) the queue was refused 332 times in a session with 15,800 textures waiting, and
+    # roads and walls showed black. On the older tree the same change took the captures over 20% near-black from
+    # 21% to 8% with the frame rate unchanged (27/11). What they hold plus some:
+    $settings.VICTORY_CARD_ROOM_FOR_TARGETS_MB = '1152'
 }
 if ($Dlss -ne 'off') {
     # NVIDIA's files: where VICTORY_STREAMLINE_DIR says, else where Get-NVIDIA-DLSS.cmd puts them.
