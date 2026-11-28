@@ -58,5 +58,8 @@ jobs:
       # depth_bounds_pipeline_loads_and_filters_draws fails on the hosted
       # runner's D3D12 (the draw outside the bounds is not rejected) and
       # passes on an RTX 4080 with the Agility runtime; skipped here only.
+      # One test at a time: in parallel on the runner, a different test failed
+      # on each of two runs (a write-watch assertion, then an access violation
+      # in the victory-shader tests).
       - name: Tests
-        run: cargo test --workspace --locked --no-fail-fast -- --skip pipeline::host::tests::depth_bounds_pipeline_loads_and_filters_draws
+        run: cargo test --workspace --locked --no-fail-fast -- --test-threads=1 --skip pipeline::host::tests::depth_bounds_pipeline_loads_and_filters_draws
