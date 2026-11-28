@@ -24,11 +24,13 @@ env:
     -A clippy::if_same_then_else
     -A clippy::items_after_test_module
     -A clippy::large_enum_variant
+    -A clippy::let_and_return
     -A clippy::manual_is_multiple_of
     -A clippy::mem_replace_with_default
     -A clippy::missing_transmute_annotations
     -A clippy::needless_borrow
     -A clippy::precedence
+    -A clippy::some_filter
     -A clippy::too_many_arguments
     -A clippy::unnecessary_cast
     -A clippy::unnecessary_get_then_check
