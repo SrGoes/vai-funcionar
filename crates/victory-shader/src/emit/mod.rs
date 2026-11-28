@@ -916,7 +916,7 @@ fn loops_wave(native: &NativeProgram) -> bool {
 /// [`emit_program_plain`]; a program that comes out depending on the host's waves is
 /// translated once more with the per-lane branches that close or leave its loops taken by
 /// each host wave together ([`structure::structure_wide_host`]), and that translation is the
-/// one given if it needs no wider waves.
+/// one given if it needs no wider waves (and, with [`wide_after_loops`], fits the host's).
 ///
 /// Why: the lowering turns the console's wave loops into loops each lane leaves on its own,
 /// and takes the code behind a loop as code the whole wave runs together. On NVIDIA the lanes
@@ -952,7 +952,9 @@ fn emit_program(
     });
     let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
     match again {
-        Ok((shader, Some(w))) if w <= *wave => {
+        Ok((shader, Some(w)))
+            if w <= *wave && (!wide_after_loops() || w <= lower::host_max_wave()) =>
+        {
             if why {
                 eprintln!("WAVE-LOOPS {} loop branches taken by each host wave together", loops.len());
             }
@@ -971,6 +973,28 @@ fn emit_program(
             first
         }
     }
+}
+
+/// `VICTORY_WIDE_AFTER_LOOPS=1` (off by default): [`emit_program`] takes the loops' second
+/// translation only when it fits the host's waves; otherwise it gives the first one with the
+/// blocks the lowering named ([`lower::take_needs`]) put back. Why: [`widen`] goes on from
+/// those blocks. When the second one also came out at 64 lanes it was taken and the blocks
+/// forgotten, and `widen` stopped at once: `water_shading:CS_TransmissionVolumetricsSubmerged`
+/// (the game, build 1.0.2.1) took 0 branches wave-wide and was refused on 32-lane hosts, where
+/// with `VICTORY_LOOPS_WAVE=0` it took 29 and translated for waves of 32. Outside `widen`
+/// nothing changes: both translations needed waves of 64.
+fn wide_after_loops() -> bool {
+    #[cfg(test)]
+    if let Some(on) = WIDE_AFTER_LOOPS_FOR_TESTS.get() {
+        return on;
+    }
+    std::env::var("VICTORY_WIDE_AFTER_LOOPS").is_ok_and(|v| v.trim() == "1")
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`wide_after_loops`] for the tests of one thread.
+    static WIDE_AFTER_LOOPS_FOR_TESTS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 fn emit_program_plain(

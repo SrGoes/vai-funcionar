@@ -83,6 +83,7 @@ fn build() -> [u8; 32] {
             "VICTORY_LDS_BOUNDS",
             "VICTORY_LOOPS_WAVE",
             "VICTORY_LDS_FIRST_INIT",
+            "VICTORY_WIDE_AFTER_LOOPS",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
