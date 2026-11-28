@@ -646,7 +646,25 @@ pub fn emit(
             )
             || matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 128)
                 && c.digest == [0x50, 0xcf, 0x28, 0x32, 0x8b, 0x58, 0x05, 0x3d, 0xa8, 0x9a, 0x8d, 0xa0, 0x1a, 0xa1, 0x23, 0xc6];
-        let wide_on = wide_option.as_ref().map_or(scene_kernel, |v| v == "1");
+        // More of that shape, only with `VICTORY_WAVE_WIDE_MORE=1` (off by default): the water's
+        // `CS_TransmissionVolumetrics_VolumePortalsOnly` and the particle emitters'
+        // `GpuParticleEmit:CS_Emit_Dynamic_Model_AttachMesh`, `_AttachMesh_Skinned` and
+        // `_Skinned` (the game, build 1.0.2.1), groups of 64, refused on 32-lane hosts ("no
+        // wave32 lowering for this wave64 program"). Widened they translate for waves of 32
+        // (17 branches taken wave-wide for the water's, 2 to 5 for the emitters'). Off until
+        // what their group barriers cost a frame, and whether the card keeps them, is
+        // measured. The emitters want `VICTORY_WIDE_AFTER_LOOPS=1` too ([`emit_program`]):
+        // without it they take 0 branches wave-wide and are refused as before.
+        let more_kernels = std::env::var("VICTORY_WAVE_WIDE_MORE").is_ok_and(|v| v.trim() == "1")
+            && matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64)
+            && matches!(
+                c.digest,
+                [0x4f, 0xa5, 0x83, 0x20, 0xd7, 0x61, 0xbf, 0x55, 0x81, 0x20, 0xf9, 0x2c, 0x19, 0xd3, 0x84, 0xaa]
+                    | [0x37, 0x0e, 0x87, 0xce, 0x06, 0x2b, 0x9a, 0x4d, 0xed, 0x2a, 0xa7, 0x90, 0xf9, 0xea, 0x6b, 0xfd]
+                    | [0xb3, 0x0a, 0x8c, 0x4e, 0xe5, 0x8b, 0x40, 0x88, 0x85, 0x61, 0xd5, 0x2b, 0x15, 0xa8, 0x0a, 0xe2]
+                    | [0x27, 0x7f, 0x65, 0x9e, 0x06, 0xf0, 0x2b, 0xa2, 0x68, 0x5a, 0xff, 0x1d, 0x0d, 0xf0, 0x3f, 0x5e]
+            );
+        let wide_on = wide_option.as_ref().map_or(scene_kernel || more_kernels, |v| v == "1");
         // A single guest wave can iterate an active-lane loop until both host
         // halves have finished. The precise latch and convergence conditions
         // for the driver compute route are checked by widen().
