@@ -81,6 +81,8 @@ fn build() -> [u8; 32] {
             "VICTORY_THREAD_TICKET",
             "VICTORY_LDS_LOOP_ATOMICS",
             "VICTORY_LDS_BOUNDS",
+            "VICTORY_LOOPS_WAVE",
+            "VICTORY_LDS_FIRST_INIT",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
