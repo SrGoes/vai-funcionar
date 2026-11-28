@@ -24,7 +24,10 @@ queue between two presents (the first may be the swap chain's own work for
 the frame before). One capture per process. At the frame's first submission
 the card is drained and its memory copied out; before each later one the card
 is drained again and what the CPU changed is written. The title stands still
-meanwhile. `frame recorder: the frame is captured` in the log and `frame.bin`
+meanwhile, and its sleeps do not count that time: its `Sleep` and `SleepEx`
+wait it out (a hang watchdog that counts sleeps would end it otherwise).
+After each submission the log tells how long the capture took so far, and
+where. `frame recorder: the frame is captured` in the log and `frame.bin`
 in the folder mean it is done; `failed.txt` that it failed.
 
 **Read `notes.txt`**: everything that could not be recorded is listed there

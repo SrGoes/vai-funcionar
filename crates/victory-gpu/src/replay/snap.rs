@@ -15,6 +15,7 @@ use windows::core::Interface;
 use super::gpu::{self, Seen, Worker};
 use super::record::{At, Heap, Ours, Recorder, Res, lock, not_recorded_calls, read};
 use super::states::{COMMON, COPY_SOURCE, Change, States};
+use super::still::Still;
 use super::wire::{
     self, ALL, Cmd, Content, Delta, Loc, MISSING, NONE, Place, Slot, Va, ZERO, slot,
 };
@@ -96,6 +97,7 @@ pub(super) fn submit(
             .map(|c| c.as_ref().and_then(|c| c.0.clone()))
             .collect();
         let _ours = Ours::new();
+        let _still = Still::new();
         if let Err(e) = c.submit(r, queue, &commands) {
             stop(r, &mut phase, &*e);
         }
@@ -161,6 +163,7 @@ pub(super) fn present(r: &Recorder, texture: &ID3D12Resource, state: u32) {
         }
         Stage::Capturing(c) if c.started => {
             let _ours = Ours::new();
+            let _still = Still::new();
             let done = c.present(r, texture, state).and_then(|()| {
                 if c.frame < r.settings.frames {
                     return Ok(false);
@@ -552,6 +555,7 @@ impl Capture {
             free.send(i)?;
         }
         let maps: Vec<usize> = stagings.iter().map(|s| s.1 as usize).collect();
+        let (mut card, mut disk) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
         std::thread::scope(|scope| -> Result<(), Fault> {
             for _ in 0..stagings.len() {
                 let (work, free, maps, file, end, contents, failed) =
@@ -601,15 +605,21 @@ impl Capture {
                 if pieces.is_empty() {
                     continue;
                 }
+                let waited = Instant::now();
                 let i = freed.recv()?;
+                disk += waited.elapsed();
+                let copied = Instant::now();
                 let value = self
                     .worker
                     .send(|list| copy_out(&device, list, &self.states, &pieces, &stagings[i].0))?;
                 self.worker.wait(value)?;
+                card += copied.elapsed();
                 todo.send((i, pieces))?;
             }
             Ok(())
         })?;
+        *self.took.entry("contents: copies on the card").or_default() += card;
+        *self.took.entry("contents: waits for the disk").or_default() += disk;
         if let Some(e) = lock(&failed).take() {
             return Err(e.into());
         }
@@ -867,7 +877,23 @@ impl Capture {
             deltas,
             views,
         });
+        // Said as it goes: a capture that does not end still tells.
+        tracing::info!(
+            submission = self.submits.len(),
+            "frame recorder: {:.1} s so far: {}",
+            self.began.elapsed().as_secs_f64(),
+            self.times()
+        );
         Ok(())
+    }
+
+    /// Where the time went.
+    fn times(&self) -> String {
+        self.took
+            .iter()
+            .map(|(what, d)| format!("{what} {:.1} s", d.as_secs_f64()))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     fn present(&mut self, r: &Recorder, texture: &ID3D12Resource, state: u32) -> Result<(), Fault> {
@@ -1031,7 +1057,7 @@ impl Capture {
             bytes >> 20,
             self.delta_at.load(Ordering::Relaxed) >> 20,
             self.began.elapsed().as_secs_f64(),
-            self.took.iter().map(|(what, d)| format!("{what} {:.1} s", d.as_secs_f64())).collect::<Vec<_>>().join(", ")
+            self.times()
         ));
         for n in &notes {
             tracing::info!("frame recorder: {n}");

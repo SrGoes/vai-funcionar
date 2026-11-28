@@ -2,7 +2,7 @@
 //! is set to a copy of its table ([`Shim`]) with some entries changed. Other
 //! objects of the class keep theirs, so what is not asked for is untouched.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::c_void;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,8 +25,17 @@ struct Shim {
 
 const TO_ORIG: usize = std::mem::offset_of!(Shim, table) - std::mem::offset_of!(Shim, orig);
 
-/// The shims made, by the address objects point at.
-static MADE: Mutex<BTreeSet<usize>> = Mutex::new(BTreeSet::new());
+/// The shims made: by the address objects point at, and by what they were
+/// made for (state and own table).
+struct Made {
+    tables: BTreeSet<usize>,
+    by: BTreeMap<(usize, usize), usize>,
+}
+
+static MADE: Mutex<Made> = Mutex::new(Made {
+    tables: BTreeSet::new(),
+    by: BTreeMap::new(),
+});
 
 unsafe fn shim(this: *mut c_void) -> *const Shim {
     // SAFETY: the caller's object points into a shim.
@@ -104,7 +113,7 @@ pub(super) unsafe fn install(
     let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: a live COM object starts with its table's address.
     let at = unsafe { *this.cast::<usize>() };
-    if made.contains(&at) {
+    if made.tables.contains(&at) {
         return false;
     }
     let mut new = Box::new(Shim {
@@ -125,7 +134,9 @@ pub(super) unsafe fn install(
     }
     patch(&mut new.table);
     let new: &'static Shim = Box::leak(new);
-    made.insert(new.table.as_ptr() as usize);
+    made.tables.insert(new.table.as_ptr() as usize);
+    made.by
+        .insert((state as usize, at), new.table.as_ptr() as usize);
     // SAFETY: the object's first word, its table's address.
     unsafe { this.cast::<*const usize>().write(new.table.as_ptr()) };
     true
@@ -147,12 +158,16 @@ pub(super) unsafe fn table(this: *mut c_void) -> usize {
 pub(super) unsafe fn ours(this: *mut c_void) -> bool {
     // SAFETY: the caller's.
     let at = unsafe { table(this) };
-    MADE.lock().unwrap_or_else(|e| e.into_inner()).contains(&at)
+    MADE.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .tables
+        .contains(&at)
 }
 
 /// After a method that may have set the object's table pointer anew: it
-/// points at its shim (`before`, where it pointed) again. A table it did
-/// not have before gets a shim of its own.
+/// points at its shim (`before`, where it pointed) again, or at the one made
+/// for its new table (a list's open and closed tables differ in the Agility
+/// SDK runtime). A table it did not have before gets a shim of its own.
 ///
 /// # Safety
 /// As [`install`]; `before` is a shim's table.
@@ -170,10 +185,14 @@ pub(super) unsafe fn again(
         let shim = (before as *const u8)
             .sub(std::mem::offset_of!(Shim, table))
             .cast::<Shim>();
-        if (*shim).orig as usize == now {
-            this.cast::<usize>().write(before);
-        } else {
-            install(this, (*shim).state, patch);
+        let state = (*shim).state;
+        let made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+        match made.by.get(&(state as usize, now)) {
+            Some(&known) => this.cast::<usize>().write(known),
+            None => {
+                drop(made);
+                install(this, state, patch);
+            }
         }
     }
 }
@@ -188,7 +207,7 @@ pub(super) unsafe fn remove(this: *mut c_void) {
     // SAFETY: as in `install`.
     unsafe {
         let at = *this.cast::<usize>();
-        if made.contains(&at) {
+        if made.tables.contains(&at) {
             let own = (*shim(this)).orig;
             this.cast::<*const usize>().write(own);
         }
@@ -341,6 +360,15 @@ mod tests {
             again(this, shim, patch);
             assert!(ours(this) && table(this) != shim);
             assert_eq!(call(&mut a, 0), 230 + 1000);
+            // A list goes between two tables (open, closed): each keeps its
+            // shim, none is made anew.
+            let second = table(this);
+            a.vtbl = &vtbl;
+            again(this, second, patch);
+            assert_eq!(table(this), shim);
+            a.vtbl = &other;
+            again(this, shim, patch);
+            assert_eq!(table(this), second);
             remove(this);
             assert!(std::ptr::eq(a.vtbl, &other));
             assert_eq!(call(&mut a, 0), 115);

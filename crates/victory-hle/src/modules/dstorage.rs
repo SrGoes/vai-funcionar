@@ -154,10 +154,7 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     if stream_log::on() {
         stream_log::line(format_args!("F\t{:x}\t{kept}", file as usize));
     }
-    // Only the walls trace reads the list, so it isn't kept without it.
-    if walls_trace() > 0 {
-        WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner()).push((file as usize, kept));
-    }
+    WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner()).push((file as usize, kept));
     put(out, file)
 }
 
@@ -442,10 +439,7 @@ fn read_direct(file: &std::fs::File, out: &mut [u8], offset: u64) -> std::io::Re
     /// Read at a time.
     const MOST: usize = 1 << 20;
     let sector = SECTOR as u64;
-    if offset.is_multiple_of(sector)
-        && out.len().is_multiple_of(SECTOR)
-        && (out.as_ptr() as usize).is_multiple_of(SECTOR)
-    {
+    if offset % sector == 0 && out.len() % SECTOR == 0 && out.as_ptr() as usize % SECTOR == 0 {
         return read_overlapped(file, out, offset);
     }
     thread_local! {
@@ -635,16 +629,38 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        // As many workers as processors (`VICTORY_DSTORAGE_WORKERS=<n>`: that many), below
+        // normal priority (`VICTORY_DSTORAGE_PRIORITY=<-2..2>`, 0: normal, as before
+        // 2026-11-27). While a scene streams in, all of them unpack at once: in a crowded
+        // cutscene (timeline tl5, 176 s into a new game, 62 ms a frame) 16 workers ran 10 ms
+        // a frame each beside 8 listing threads of 20 ms, and the threads a frame waits for
+        // stood "woken, not running yet" for 9.5 ms of each frame's chain. Below them in
+        // priority the workers take the processors nobody of the frame wants. The process
+        // runs above normal (`runtime::ahead_of_other_programs`), so they still come before
+        // other programs' threads.
+        let number = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<i32>().ok());
+        let workers = match number("VICTORY_DSTORAGE_WORKERS") {
+            Some(n) if n > 0 => n as usize,
+            _ => std::thread::available_parallelism().map_or(4, |n| n.get()),
+        };
+        let priority = number("VICTORY_DSTORAGE_PRIORITY").map_or(-1, |p| p.clamp(-2, 2));
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
                     .name(format!("dstorage {i}"))
-                    .spawn(|| work(scheduler))
+                    .spawn(move || {
+                        #[cfg(windows)]
+                        if priority != 0 {
+                            use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority};
+                            // SAFETY: this thread's own priority.
+                            unsafe { SetThreadPriority(GetCurrentThread(), priority) };
+                        }
+                        work(scheduler)
+                    })
                     .is_ok()
             })
             .count();
-        tracing::info!(workers = started, "dstorage: workers");
+        tracing::info!(workers = started, priority, "dstorage: workers (VICTORY_DSTORAGE_WORKERS, VICTORY_DSTORAGE_PRIORITY)");
     });
     Some(scheduler)
 }
@@ -681,8 +697,7 @@ fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::
     } else {
         let files = WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner());
         let source = request.source as usize;
-        // From the back: an address used again names the file opened last.
-        files.iter().rev().find(|f| f.0 == source).map_or_else(|| "?".to_string(), |f| f.1.clone())
+        files.iter().find(|f| f.0 == source).map_or_else(|| "?".to_string(), |f| f.1.clone())
     };
     let hr = match result {
         Ok(()) => 0,
@@ -1420,8 +1435,6 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         let mut packed = vec![0; request.intermediate_size as usize];
         let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
         packed.truncate(n);
-        // The compressed bytes aren't needed past here: not held while BCPack unpacks.
-        drop(source);
         Cow::Owned(packed)
     } else {
         source
@@ -2155,7 +2168,7 @@ mod tests {
         for round in 0..2 {
             for mode in [Io::One, Io::Handles, Io::Overlapped, Io::Direct] {
                 let file = Files::open_for_test(&path, mode);
-                let at: Vec<u64> = (0..READS).map(|_| (random() % (len - SIZE as u64)) & !15).collect();
+                let at: Vec<u64> = (0..READS).map(|_| random() % (len - SIZE as u64) & !15).collect();
                 for pass in ["cold", "again"] {
                     let next = std::sync::atomic::AtomicUsize::new(0);
                     let busy = AtomicU64::new(0);

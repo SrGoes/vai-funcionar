@@ -32,7 +32,7 @@ const SHORT: usize = 256;
 
 /// Whether a run of `len` bytes at offset `at` of a copy goes as pairs.
 fn short(at: usize, len: usize) -> bool {
-    len <= SHORT && at.is_multiple_of(4) && len.is_multiple_of(4)
+    len <= SHORT && at % 4 == 0 && len % 4 == 0
 }
 
 /// Whether a run of `len` bytes at offset `at` of a copy in the card's memory
@@ -118,26 +118,9 @@ unsafe impl Send for Memory {}
 /// What submissions that have run gave back.
 static SPARE: Mutex<Vec<Memory>> = Mutex::new(Vec::new());
 
-/// At most this much is kept: 768 MiB, or 256 MiB of the card's memory with
-/// [`on_card`]. `VICTORY_SEND_SPARE_MB` sets it instead (`0`: none kept, all
-/// is freed when its submission has run).
+/// At most this much is kept (of the card's memory, with [`on_card`]).
 fn kept() -> u64 {
-    static ASKED: OnceLock<Option<u64>> = OnceLock::new();
-    let asked = *ASKED.get_or_init(|| {
-        std::env::var("VICTORY_SEND_SPARE_MB")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-    });
-    kept_for(asked, on_card())
-}
-
-/// [`kept`] for a limit asked in MiB and [`on_card`].
-fn kept_for(asked_mb: Option<u64>, card: bool) -> u64 {
-    match asked_mb {
-        Some(mb) => mb.saturating_mul(1 << 20),
-        None if card => 256 << 20,
-        None => 768 << 20,
-    }
+    if on_card() { 256 << 20 } else { 768 << 20 }
 }
 
 /// Whether the memory lies in the card's memory, written by the CPU through
@@ -342,22 +325,5 @@ impl Own {
     /// The memory, to be kept until the submission has run.
     pub(super) fn memory(self) -> Memory {
         self.memory
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::kept_for;
-
-    /// Unset, as before: 768 MiB, 256 MiB in the card's memory. An asked
-    /// limit wins.
-    #[test]
-    fn kept_is_as_before_unless_asked() {
-        assert_eq!(kept_for(None, false), 768 << 20);
-        assert_eq!(kept_for(None, true), 256 << 20);
-        for card in [false, true] {
-            assert_eq!(kept_for(Some(64), card), 64 << 20);
-            assert_eq!(kept_for(Some(0), card), 0);
-        }
     }
 }

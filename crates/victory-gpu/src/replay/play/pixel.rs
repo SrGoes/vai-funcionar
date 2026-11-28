@@ -205,14 +205,6 @@ struct Textures {
     drawn: HashMap<(u32, u32), [f32; 4]>,
 }
 
-/// Texels to copy to [`PROBE`]: the `spots`, from `first` on; `copied`: a copy
-/// to them went before.
-struct Probe<'a> {
-    spots: &'a [Spot],
-    first: u64,
-    copied: bool,
-}
-
 impl Player {
     fn texture(&self, id: u32) -> Option<&wire::Resource> {
         let o = self.objects.get(&id)?;
@@ -494,20 +486,18 @@ impl Player {
         })
     }
 
-    /// The commands that copy the texels of `probe` to [`PROBE`].
+    /// The commands that copy the texels of `spots` to [`PROBE`] from `first`
+    /// on; `copied`: a copy to them went before.
     fn take(
         &self,
-        probe: Probe,
+        spots: &[Spot],
+        first: u64,
         states: &States,
         t: &Textures,
+        copied: bool,
         scratch: &mut u64,
         out: &mut Vec<Cmd>,
     ) {
-        let Probe {
-            spots,
-            first,
-            copied,
-        } = probe;
         let (mut to, mut from, mut copies) = (Vec::new(), Vec::new(), Vec::new());
         let mut moved = HashSet::new();
         for (i, s) in spots.iter().enumerate() {
@@ -730,12 +720,7 @@ impl Player {
                     let runs = if c.runs_shaders() { pso } else { NONE };
                     let mut take = |before: bool, part: u32, spots: &[Spot], out: &mut Vec<Cmd>| {
                         let first = samples.len() as u64;
-                        let probe = Probe {
-                            spots,
-                            first,
-                            copied: copied && !before,
-                        };
-                        self.take(probe, &states, &t, &mut scratch, out);
+                        self.take(spots, first, &states, &t, copied && !before, &mut scratch, out);
                         samples.extend(spots.iter().map(|spot| Sample {
                             list: here,
                             command: n,

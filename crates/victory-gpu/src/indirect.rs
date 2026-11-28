@@ -41,8 +41,10 @@ use windows::core::s;
 use crate::host::{HostList, host, transition};
 
 pub(crate) mod batch;
+pub(crate) mod merge;
 
 const SOURCE: &str = r#"
+#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
 cbuffer Record : register(b0) {
     uint kind;
     uint stride;
@@ -56,12 +58,10 @@ cbuffer Record : register(b0) {
 };
 ByteAddressBuffer src_args : register(t0);
 ByteAddressBuffer count_buf : register(t1);
-// Written as words: Wine's compiler stores to structured buffers only.
-RWStructuredBuffer<uint> dst_args : register(u0);
+RWByteAddressBuffer dst_args : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
-// records run empty. In words: 0 the budget, 1-4 diagnostics (the old
-// bytes 4, 8, 12, 16).
-RWStructuredBuffer<uint> budget : register(u1);
+// records run empty.
+RWByteAddressBuffer budget : register(u1);
 static const uint BUDGET = 1u << 27;
 // The vertices or indices an instance from which a draw record runs empty.
 static const uint MOST_DRAW = 1u << 23;
@@ -78,6 +78,7 @@ groupshared uint costs[64];
 groupshared uint fits[64];
 groupshared uint largest_asked;
 groupshared uint all_asked;
+[RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     uint eff_count = records;
@@ -89,8 +90,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     // and store nothing.
     bool active = id.x < eff_count;
     uint src_at = args_offset + id.x * stride;
-    // In words: strides are multiples of 4.
-    uint dst_at = id.x * (stride / 4);
+    uint dst_at = id.x * stride;
     uint cost = 0;
     uint asked = 0;
     uint2 draw_counts = uint2(0, 0);
@@ -162,8 +162,8 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         // (`rest`).
         // Only the group's own records are walked (one, clamped alone).
         uint before;
-        InterlockedOr(budget[0], 0, before);
-        // No `[allow_uav_condition]`: Wine's compiler stops at it.
+        budget.InterlockedOr(0, 0, before);
+        [allow_uav_condition]
         while (before < BUDGET) {
             uint next = before;
             for (uint j = 0; j < n; j++) {
@@ -174,7 +174,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             }
             if (next == before) break;
             uint prev;
-            InterlockedCompareExchange(budget[0], before, next, prev);
+            budget.InterlockedCompareExchange(0, before, next, prev);
             if (prev == before) break;
             before = prev;
         }
@@ -196,17 +196,17 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         // the largest cost there was (small ones are not told).
         uint told;
         if (refused > 0) {
-            InterlockedAdd(budget[3], refused, told);
+            budget.InterlockedAdd(12, refused, told);
         }
         if (biggest >= (1u << 22)) {
-            InterlockedMax(budget[4], biggest, told);
+            budget.InterlockedMax(16, biggest, told);
         }
     }
     GroupMemoryBarrierWithGroupSync();
     if (gi == 0 && kind > 2 && n > 0) {
         uint was;
-        InterlockedMax(budget[1], largest_asked, was);
-        InterlockedAdd(budget[2], all_asked, was);
+        budget.InterlockedMax(4, largest_asked, was);
+        budget.InterlockedAdd(8, all_asked, was);
     }
     if (!active) {
         return;
@@ -216,20 +216,17 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         if (over) {
             draw_counts = uint2(0, 0);
         }
-        dst_args[dst_at] = draw_counts.x;
-        dst_args[dst_at + 1] = draw_counts.y;
+        dst_args.Store2(dst_at, draw_counts);
         for (uint off = 8; off < stride; off += 4) {
-            dst_args[dst_at + off / 4] = src_args.Load(src_at + off);
+            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
         }
     } else {
         if (over) {
             groups = uint3(0, 0, 0);
         }
-        dst_args[dst_at] = groups.x;
-        dst_args[dst_at + 1] = groups.y;
-        dst_args[dst_at + 2] = groups.z;
+        dst_args.Store3(dst_at, groups);
         for (uint off = 12; off < stride; off += 4) {
-            dst_args[dst_at + off / 4] = src_args.Load(src_at + off);
+            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
         }
     }
 }
@@ -279,64 +276,22 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
 /// its last 1,905 tiles, the lowest of the picture. The console runs what it
 /// is asked (its dispatch counts are 32 bits), and so does an AMD card, whose
 /// dispatch packets and group numbers are the same; D3D12 does not look at
-/// indirect counts. So does an NVIDIA card (measured, [`wide_card`]).
-/// Other cards stay at 65,535.
-///
-/// `wide` is whether the card runs them by default ([`wide_card`]).
-/// `VICTORY_INDIRECT_WIDE=1` makes every card wide, `=0` none; unset (or
-/// anything else) the card's default holds.
-fn widest(wide: bool) -> u32 {
-    match std::env::var("VICTORY_INDIRECT_WIDE").as_deref() {
-        Ok("1") => 1 << 20,
-        Ok("0") => 65_535,
-        _ if wide => 1 << 20,
-        _ => 65_535,
-    }
+/// indirect counts. Other cards stay at 65,535.
+fn widest(amd: bool) -> u32 {
+    let on = std::env::var_os("VICTORY_INDIRECT_WIDE").is_none_or(|v| v != "0");
+    if amd && on { 1 << 20 } else { 65_535 }
 }
 
-/// Whether `device`'s card runs indirect dispatches wider than 65,535
-/// groups by default ([`widest`]).
-///
-/// NVIDIA's do too: on an RTX 4070 the test
-/// `card_runs_wide_indirect_dispatches` saw every group of 67,440,
-/// 115,200 and 2^20 run once under its own number, clamped one by one and
-/// in a batch, as on AMD.
-fn wide_card(device: &ID3D12Device) -> bool {
-    amd(device) || nvidia(device)
-}
-
-/// The PCI vendor of `device`'s adapter (0: not found), looked up through
-/// DXGI once per adapter and kept: callers ask on hot paths (the clamp, the
-/// host), and a test process may hold devices of more than one adapter
-/// (WARP and the card), so the answer is kept by adapter, not once.
-fn vendor(device: &ID3D12Device) -> u32 {
-    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4};
-    static KNOWN: std::sync::Mutex<Vec<((u32, i32), u32)>> = std::sync::Mutex::new(Vec::new());
-    // SAFETY: a plain query of a live device.
-    let luid = unsafe { device.GetAdapterLuid() };
-    let key = (luid.LowPart, luid.HighPart);
-    if let Some(&(_, v)) = KNOWN.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(k, _)| *k == key) {
-        return v;
-    }
-    // SAFETY: plain queries.
-    let v = unsafe {
-        CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
-            .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(luid))
-            .and_then(|a| a.GetDesc1())
-            .map_or(0, |d| d.VendorId)
-    };
-    KNOWN.lock().unwrap_or_else(|e| e.into_inner()).push((key, v));
-    v
-}
-
-/// Whether `device` is an AMD card's (PCI vendor 0x1002).
+/// Whether `device` is an AMD card's.
 pub(crate) fn amd(device: &ID3D12Device) -> bool {
-    vendor(device) == 0x1002
-}
-
-/// Whether `device` is an NVIDIA card's (PCI vendor 0x10DE).
-pub(crate) fn nvidia(device: &ID3D12Device) -> bool {
-    vendor(device) == 0x10de
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4};
+    // SAFETY: plain queries.
+    unsafe {
+        CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid()))
+            .and_then(|a| a.GetDesc1())
+            .is_ok_and(|d| d.VendorId == 0x1002)
+    }
 }
 
 /// Whether a record that does not fit in what is left of its list's budget
@@ -350,9 +305,9 @@ fn rest() -> u32 {
 /// The clamp compiled from `source` (ours, or in the benchmark the one it
 /// replaced).
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
+    #[cfg(feature = "diagnostics")]
     let batched = source == batch::SOURCE;
-    let root = root_signature(device, batched)?;
-    let source = &format!("#define WIDEST {}u\n#define REST {}\n{source}", widest(wide_card(device)), rest());
+    let source = &format!("#define WIDEST {}u\n#define REST {}\n{source}", widest(amd(device)), rest());
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
@@ -385,10 +340,11 @@ fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp
         return Err(e);
     }
     let code = code.ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: the blob's own bytes.
+    // SAFETY: the blob's own bytes; the root signature is inside the shader.
     unsafe {
         let bytes =
             std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             CS: D3D12_SHADER_BYTECODE {
@@ -400,71 +356,6 @@ fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp
         #[cfg(feature = "diagnostics")]
         crate::host::name(&pso, || crate::replay::play::CLAMP.into());
         Ok(Clamp { root, pso })
-    }
-}
-
-/// The clamps' root signatures, made here rather than taken from the shader:
-/// under Wine `D3DCompile` is vkd3d-shader's, which does not embed a
-/// `[RootSignature]`. The clamp: six constants at b0, the source arguments
-/// and the count (t0, t1), the clamped arguments and the budget (u0, u1).
-/// The batched clamp: the four sources and the jobs (t0-t4), then u0, u1.
-/// Flags as a version 1.1 root signature string gets by default.
-fn root_signature(device: &ID3D12Device, batched: bool) -> windows::core::Result<ID3D12RootSignature> {
-    let view = |kind: D3D12_ROOT_PARAMETER_TYPE, register: u32| D3D12_ROOT_PARAMETER1 {
-        ParameterType: kind,
-        Anonymous: D3D12_ROOT_PARAMETER1_0 {
-            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
-                ShaderRegister: register,
-                RegisterSpace: 0,
-                Flags: if kind == D3D12_ROOT_PARAMETER_TYPE_UAV {
-                    D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE
-                } else {
-                    D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE
-                },
-            },
-        },
-        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
-    };
-    let (srv, uav) = (D3D12_ROOT_PARAMETER_TYPE_SRV, D3D12_ROOT_PARAMETER_TYPE_UAV);
-    let params: Vec<D3D12_ROOT_PARAMETER1> = if batched {
-        (0..5).map(|t| view(srv, t)).chain([view(uav, 0), view(uav, 1)]).collect()
-    } else {
-        let constants = D3D12_ROOT_PARAMETER1 {
-            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
-            Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 6 },
-            },
-            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
-        };
-        vec![constants, view(srv, 0), view(srv, 1), view(uav, 0), view(uav, 1)]
-    };
-    let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
-        Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
-        Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
-            Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
-                NumParameters: params.len() as u32,
-                pParameters: params.as_ptr(),
-                NumStaticSamplers: 0,
-                pStaticSamplers: std::ptr::null(),
-                Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
-            },
-        },
-    };
-    let mut blob: Option<ID3DBlob> = None;
-    let mut error: Option<ID3DBlob> = None;
-    // SAFETY: `desc` points at the live `params`; the blobs are read in full
-    // before they are released.
-    unsafe {
-        if let Err(e) = D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error)) {
-            if let Some(error) = error {
-                let text = std::slice::from_raw_parts(error.GetBufferPointer().cast::<u8>(), error.GetBufferSize());
-                tracing::warn!("argument clamp root signature: {}", String::from_utf8_lossy(text));
-            }
-            return Err(e);
-        }
-        let blob = blob.ok_or_else(windows::core::Error::empty)?;
-        let bytes = std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
-        device.CreateRootSignature(0, bytes)
     }
 }
 
@@ -801,8 +692,7 @@ void main() {
                     factory.EnumAdapters(0).ok()?
                 };
                 let desc = adapter.cast::<IDXGIAdapter1>().ok()?.GetDesc1().ok()?;
-                let is_sw = (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) || desc.VendorId == 0x1414;
-                if software != is_sw {
+                if software != (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
                     return None;
                 }
                 let mut device: Option<ID3D12Device> = None;
@@ -2780,10 +2670,6 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         let Some(host) = super::host() else {
             return;
         };
-        if host.is_software() {
-            eprintln!("WARP software rasterizer does not emulate GPU indirect budgets; skipped");
-            return;
-        }
         let Ok(list) = host.new_list() else {
             return;
         };
@@ -2811,8 +2697,8 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             }
             sig.unwrap()
         };
-        // Two records of 2^20 groups at 64 units per group spend exactly the 2^27 budget.
-        let Some((big, big_ptr)) = host.shared_buffer(2 * u64::from(STRIDE)) else {
+        // Three records of 65,535 x 16 groups: about half the budget each.
+        let Some((big, big_ptr)) = host.shared_buffer(3 * u64::from(STRIDE)) else {
             return;
         };
         let Some((small, small_ptr)) = host.shared_buffer(u64::from(STRIDE)) else {
@@ -2823,8 +2709,8 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         };
         // SAFETY: mapped buffers of these sizes; nothing runs yet.
         unsafe {
-            for i in 0..2 {
-                let words = [32768u32, 32, 1];
+            for i in 0..3 {
+                let words = [65535u32, 16, 1];
                 std::ptr::copy_nonoverlapping(
                     words.as_ptr().cast::<u8>(),
                     big_ptr.add(i * STRIDE as usize),
@@ -2838,7 +2724,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         let hits_gpu = unsafe { hits_buf.GetGPUVirtualAddress() };
         for round in 0..2 {
             // Spends the budget (clamped, not executed), then one group.
-            bound(&list, (&big, 0), None, (KIND_DISPATCH, STRIDE, 2)).unwrap();
+            bound(&list, (&big, 0), None, (KIND_DISPATCH, STRIDE, 3)).unwrap();
             let scratch = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1)).unwrap();
             // SAFETY: an open list; the worker's root signature and
             // pipeline; buffers the test holds until the list has run.
@@ -3073,10 +2959,9 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         sig.unwrap()
     }
 
-    /// An AMD or NVIDIA card runs every group of an indirect dispatch of
-    /// more than 65,535, each under its own number: the title's tile lists
-    /// ([`widest`]), clamped one by one and in a batch. Others are asked only
-    /// with `VICTORY_INDIRECT_WIDE=1`; with `=0` none is.
+    /// An AMD card runs every group of an indirect dispatch of more than
+    /// 65,535, each under its own number: the title's tile lists
+    /// ([`widest`]), clamped one by one and in a batch. Others are not asked.
     #[test]
     fn card_runs_wide_indirect_dispatches() {
         const CS: &str = r#"
@@ -3095,7 +2980,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
         let Some(mut gpu) = WarpHarness::on(false) else {
             return;
         };
-        if widest(wide_card(&gpu.device)) == 65_535 {
+        if !amd(&gpu.device) || widest(true) == 65_535 {
             return;
         }
         let worker = compile_cs(&gpu.device, CS).expect("the worker must compile");
@@ -3140,26 +3025,6 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
                 let wrong = (0..runs as usize).find(|&g| word(4 + g) != 1);
                 assert_eq!((wrong, word(4 + runs as usize)), (None, 0), "every group once, asked for {asked}");
             }
-        }
-    }
-
-    /// The vendor of a device is its adapter's, kept per adapter: WARP is
-    /// neither AMD's nor NVIDIA's however often it is asked, and the card
-    /// beside it in the same process keeps its own answer.
-    #[test]
-    fn vendors_are_kept_per_adapter() {
-        let Some(warp) = WarpHarness::new() else {
-            return;
-        };
-        for _ in 0..2 {
-            assert_eq!(vendor(&warp.device), 0x1414, "WARP is Microsoft's");
-            assert!(!amd(&warp.device) && !nvidia(&warp.device));
-        }
-        drop(warp);
-        if let Some(card) = WarpHarness::on(false) {
-            let v = vendor(&card.device);
-            assert_ne!(v, 0x1414);
-            assert_eq!((amd(&card.device), nvidia(&card.device)), (v == 0x1002, v == 0x10de));
         }
     }
 
@@ -3290,14 +3155,8 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
         };
         let pass = make_from(&warp.device, batch::SOURCE).expect("the batched clamp must compile on WARP");
         const BUDGET: u32 = 1 << 27;
-        // A job charges all its executions together. If it cannot fit, only REST takes the remainder.
-        let refused_charge = if rest() == 1 { BUDGET } else { 0 };
-        for (times, records, filled, charge) in [
-            (1u32, 3u64, 2usize, BUDGET),
-            (2, 1, 1, BUDGET),
-            (1, 1, 1, BUDGET / 2),
-            (3, 1, 0, refused_charge),
-        ] {
+        // 2^26 vertices each, as much as a draw is let run: two fill it.
+        for (times, records, filled) in [(1u32, 3u64, 2usize), (2, 1, 1), (1, 1, 1), (3, 1, 0)] {
             let (_src, src_ptr, src_gpu) = warp.shared_buffer(64 << 10);
             let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
             let (back, back_ptr, _) = warp.shared_buffer(1024);
@@ -3334,7 +3193,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
             };
             assert_eq!(out.iter().filter(|&&v| v == 1 << 22).count(), filled, "{times} times {records}: {out:?}");
             assert!(out.iter().all(|&v| v == 0 || v == 1 << 22));
-            assert_eq!(spent, charge, "{times} times {records}");
+            assert_eq!(spent, BUDGET.min((1 << 26) * times * records as u32));
         }
     }
 
@@ -3402,6 +3261,101 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
             let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
             assert_eq!(hits, expected, "every execution runs what it asked for");
         }
+    }
+
+    /// Runs of executions joined ([`merge`]): a run held back is recorded
+    /// by the next title call before anything else, and by the list's close
+    /// at the latest, as one execution of its records a batch's slots apart
+    /// with a signature of that stride; each record runs once. With the
+    /// debug layer on, nothing recorded is invalid.
+    #[test]
+    fn host_list_records_held_runs() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let _ = host.log_messages();
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        let worker = compile_cs(&host.device, WORKER_CS).expect("worker shader must compile");
+        let one = one_argument(&host.device, 2, 12);
+        let joined = one_argument(&host.device, 2, batch::SLOT);
+        let Some((source, ptr)) = host.shared_buffer(1024) else {
+            return;
+        };
+        // Dispatch records 32 bytes apart, of 1 to 8 groups.
+        for i in 0..8u32 {
+            for (w, word) in [i + 1, 1, 1].into_iter().enumerate() {
+                // SAFETY: inside the mapping.
+                unsafe { ptr.cast::<u32>().add(i as usize * 8 + w).write_volatile(word) };
+            }
+        }
+        let Some((hits_buf, hits_ptr)) = host.shared_buffer(256) else {
+            return;
+        };
+        // SAFETY: a live buffer; the mapping holds 256 bytes and nothing runs.
+        let hits_gpu = unsafe {
+            std::ptr::write_bytes(hits_ptr, 0, 256);
+            hits_buf.GetGPUVirtualAddress()
+        };
+        let (mut table, scratch) = open_batch(&list, (1, &source), &[(1, source.clone())]).unwrap();
+        // SAFETY: an open list; the worker's root signature and pipeline;
+        // buffers the test holds until the list has run.
+        unsafe {
+            list.list.SetComputeRootSignature(&worker.root);
+            list.list.SetPipelineState(&worker.pso);
+            list.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+        }
+        let call = |calls, at| merge::Call {
+            calls,
+            rebinds: [0; 2],
+            kind: 2,
+            pipeline: 1,
+            single: true,
+            alone: false,
+            clamped: false,
+            epoch: 0,
+            buffer: scratch.as_raw() as usize,
+            at,
+            step: batch::SLOT,
+        };
+        // Records 0 to 2 held as one run, then 3 and 4.
+        for records in [0..3u64, 3..5] {
+            let calls = list.title_calls();
+            for r in records.clone() {
+                let at = table.place(1, r * 32, 2).unwrap();
+                let mut run = list.indirect_run();
+                if r == records.start {
+                    *run = Some((
+                        merge::Run::of(&call(calls, at), 0),
+                        Some(merge::Held { signature: one.clone(), buffer: scratch.clone() }),
+                    ));
+                    drop(run);
+                    list.hold_indirect();
+                    continue;
+                }
+                let Some((held_run, Some(held))) = run.as_mut() else {
+                    panic!("the run is held");
+                };
+                assert_eq!(merge::verdict(Some(held_run), &call(calls, at)), merge::Verdict::Joins);
+                held_run.join(&call(calls, at), 0);
+                held.signature = joined.clone();
+            }
+            if records.start == 0 {
+                list.title_call();
+                assert_eq!(list.title_calls(), calls + 1);
+                assert!(list.indirect_run().as_ref().is_some_and(|(r, held)| r.records == 3 && held.is_none()));
+            }
+        }
+        list.close();
+        assert!(list.indirect_run().as_ref().is_some_and(|(r, held)| r.records == 2 && held.is_none()));
+        assert_eq!(host.log_messages(), None, "the debug layer found an error");
+        host.execute(&[&list]);
+        list.reset();
+        assert!(list.indirect_run().is_none());
+        // SAFETY: the list has run; a mapped buffer.
+        let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
+        assert_eq!(hits, 1 + 2 + 3 + 4 + 5, "every record of both runs runs once");
     }
 
     /// What clamps of a frame cost on the card one by one and in batches
@@ -3548,6 +3502,12 @@ void work() {
         /// The same between two waits for every earlier shader write, as
         /// the clamp records them.
         ComputeWithWaits,
+        /// Nothing, and each draw an indirect execution of one record (the
+        /// records a batch's slots apart, as the layer runs the title's).
+        Indirect,
+        /// The same records in one indirect execution of them all
+        /// (`super::merge`'s joining).
+        Joined,
     }
 
     struct Rig {
@@ -3570,9 +3530,14 @@ void work() {
         heap_pairs: [[Option<ID3D12DescriptorHeap>; 2]; 2],
         tables: [D3D12_GPU_DESCRIPTOR_HANDLE; 2],
         targets: [D3D12_CPU_DESCRIPTOR_HANDLE; 2],
+        depth_written: D3D12_CPU_DESCRIPTOR_HANDLE,
         depth_tested: D3D12_CPU_DESCRIPTOR_HANDLE,
         stamps: ID3D12QueryHeap,
         back: ID3D12Resource,
+        /// [`DRAWS`] draw records of one triangle, [`super::batch::SLOT`]
+        /// bytes apart, and a draw signature of that stride.
+        records: ID3D12Resource,
+        signature: ID3D12CommandSignature,
         card: String,
     }
 
@@ -3797,6 +3762,41 @@ void work() {
                     D3D12_RESOURCE_FLAG_NONE,
                     D3D12_RESOURCE_STATE_COPY_DEST,
                 );
+                let slot = super::batch::SLOT;
+                let records = buffer(
+                    &device,
+                    u64::from(DRAWS) * u64::from(slot),
+                    D3D12_HEAP_TYPE_UPLOAD,
+                    D3D12_RESOURCE_FLAG_NONE,
+                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                );
+                let mut data = std::ptr::null_mut();
+                records.Map(0, None, Some(&mut data)).ok()?;
+                for i in 0..DRAWS as usize {
+                    // Three vertices, one instance, from 0.
+                    for (w, word) in [3u32, 1, 0, 0].into_iter().enumerate() {
+                        data.cast::<u32>().add(i * slot as usize / 4 + w).write(word);
+                    }
+                }
+                records.Unmap(0, None);
+                let argument = D3D12_INDIRECT_ARGUMENT_DESC {
+                    Type: D3D12_INDIRECT_ARGUMENT_TYPE_DRAW,
+                    ..Default::default()
+                };
+                let mut signature: Option<ID3D12CommandSignature> = None;
+                device
+                    .CreateCommandSignature(
+                        &D3D12_COMMAND_SIGNATURE_DESC {
+                            ByteStride: slot,
+                            NumArgumentDescs: 1,
+                            pArgumentDescs: &argument,
+                            NodeMask: 0,
+                        },
+                        None::<&ID3D12RootSignature>,
+                        &mut signature,
+                    )
+                    .ok()?;
+                let signature = signature?;
                 let mut stamps: Option<ID3D12QueryHeap> = None;
                 device
                     .CreateQueryHeap(
@@ -3877,9 +3877,12 @@ void work() {
                     heap_pairs,
                     tables,
                     targets,
+                    depth_written,
                     depth_tested,
                     stamps,
                     back,
+                    records,
+                    signature,
                     card,
                 };
                 rig.finish();
@@ -3993,9 +3996,20 @@ void work() {
                                 }
                                 l.SetPipelineState(&self.pipelines[0]);
                             }
+                            Between::Indirect | Between::Joined => {}
                         }
-                        l.DrawInstanced(3, 1, 0, 0);
+                        match between {
+                            Between::Indirect => {
+                                let at = u64::from(drawn % DRAWS) * u64::from(super::batch::SLOT);
+                                l.ExecuteIndirect(&self.signature, 1, &self.records, at, None, 0);
+                            }
+                            Between::Joined => {}
+                            _ => l.DrawInstanced(3, 1, 0, 0),
+                        }
                         drawn += 1;
+                    }
+                    if between == Between::Joined {
+                        l.ExecuteIndirect(&self.signature, DRAWS / lists, &self.records, 0, None, 0);
                     }
                     if part + 1 < lists {
                         // The next list of the batch: this one is sent on
@@ -4050,6 +4064,8 @@ void work() {
             ("(g) nothing changes, in 100 lists run one by one", Between::Nothing, 100),
             ("(h) a compute pass of ours of one group before every draw", Between::Compute, 1),
             ("(i) the same pass between two waits for earlier shader writes", Between::ComputeWithWaits, 1),
+            ("(j) nothing changes, each draw an indirect execution of one record", Between::Indirect, 1),
+            ("(k) the same records in one indirect execution of them all", Between::Joined, 1),
         ];
         let mut least = Vec::new();
         for (name, between, lists) in variants {

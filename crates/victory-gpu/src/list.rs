@@ -150,7 +150,27 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 /// is a host GPU.
 #[cfg(windows)]
 fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
-    let Some(list) = host_list(this) else { return };
+    with_state_on(host_list(this), this, f);
+}
+
+/// As [`with_state`], for a call that only changes what the next draw or
+/// dispatch binds, which records nothing until then: not counted as a title
+/// call ([`crate::host::HostList::title_call`]); an indirect execution held
+/// back may still be joined if the binding stays as it was
+/// ([`crate::indirect::merge`]).
+#[cfg(windows)]
+fn with_binding(this: This, f: impl FnOnce(&mut crate::draw::State)) {
+    with_state_on(host_list_held(this), this, |_, s| f(s));
+}
+
+/// As [`with_state`], with `list`, the host list of `this` as it was taken.
+#[cfg(windows)]
+fn with_state_on(
+    list: Option<&crate::host::HostList>,
+    this: This,
+    f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State),
+) {
+    let Some(list) = list else { return };
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // SAFETY: the title passes one of our lists.
@@ -158,6 +178,42 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
     #[cfg(feature = "diagnostics")]
     crate::copystat::recorded(started);
+}
+
+/// Work of ours at a place in a title list (DLSS in place of the title's
+/// FidelityFX upscaling, `crate::streamline`): it is given the host list
+/// there and says whether it recorded into it; if it did, what the title set
+/// is set again before the title's next draw or dispatch.
+#[cfg(windows)]
+pub(crate) type External = Box<dyn FnOnce(&crate::host::HostList) -> bool + Send>;
+
+/// Runs `work` at this place of title list `this`: now, or, with
+/// `VICTORY_THIN=1`, when the list's calls are translated (in their order).
+/// False if the list records nowhere.
+#[cfg(windows)]
+pub(crate) fn external(this: This, work: External) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let work = match thin::put_external(this, work) {
+        Ok(()) => return true,
+        Err(work) => work,
+    };
+    if host_list(this).is_none() {
+        return false;
+    }
+    run_external(this, work);
+    true
+}
+
+/// [`external`]'s work on the list that records `this`'s calls.
+#[cfg(windows)]
+fn run_external(this: This, work: External) {
+    with_state(this, |host, state| {
+        if work(host) {
+            state.replay(host);
+        }
+    });
 }
 
 /// The submission of `lists` has run: each gives its descriptor tables'
@@ -177,9 +233,22 @@ pub(crate) fn tables_done(lists: &[This]) {
     }
 }
 
-/// The host list behind a title list, if there is a host GPU.
+/// The host list behind a title list, if there is a host GPU, for a call
+/// that records into it: counted as a title call, which records an
+/// indirect execution held back first ([`crate::host::HostList::title_call`]).
 #[cfg(windows)]
 pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
+    let list = host_list_held(this)?;
+    list.title_call();
+    Some(list)
+}
+
+/// As [`host_list`], not counted as a title call and recording nothing:
+/// for an indirect execution, which may join the one held back
+/// ([`crate::indirect::merge`]), and for calls that only change the binding
+/// ([`with_binding`]).
+#[cfg(windows)]
+fn host_list_held<'a>(this: This) -> Option<&'a crate::host::HostList> {
     if this.is_null() {
         return None;
     }
@@ -211,10 +280,10 @@ impl Detached {
     }
 }
 
-/// A host list that has run and waits to be used again, and the bytes of
-/// upload memory it keeps.
+/// A host list that has run and waits to be used again, the bytes of
+/// upload memory it keeps, and when it was put there ([`idle_trim`]).
 #[cfg(windows)]
-struct Idle(crate::host::HostList, u64);
+struct Idle(crate::host::HostList, u64, u64);
 
 // SAFETY: D3D12 objects are free-threaded, and an idle list is touched by
 // nobody until it is taken out again.
@@ -229,74 +298,46 @@ unsafe impl Send for Idle {}
 /// four in ten a budget and an argument buffer (run 61: "104 host lists
 /// made 21.2 ms" a frame, and the graphics kernel's time to free them).
 #[cfg(windows)]
-static IDLE: std::sync::Mutex<Pool> = std::sync::Mutex::new(Pool {
-    lists: Vec::new(),
-    bytes: 0,
-    low: 0,
-    since_ms: 0,
-});
-
-/// The idle host lists, the upload memory they keep between them, and the
-/// fewest there were since `since_ms`: as many as none took in that time,
-/// which [`recycle`] may let go.
-#[cfg(windows)]
-struct Pool {
-    lists: Vec<Idle>,
-    bytes: u64,
-    low: usize,
-    since_ms: u64,
-}
+static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::new(), 0));
 
 /// The most host lists kept idle (128 were too few: flights land several at
 /// a time, so lists were thrown away and others made in the same frame, with
 /// their preludes and buffers, 12 % of the submitting thread in the opening,
-/// profile cpu-1). `VICTORY_LIST_IDLE_MOST=N`: N instead of 512, from 16 to
-/// 4096.
+/// profile cpu-1), and the most upload memory they may keep
+/// between them (a list keeps scratch chunks over a reset only while lists
+/// do not share them, `VICTORY_SCRATCH_POOL=0`).
 #[cfg(windows)]
-fn idle_most() -> usize {
-    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *MOST.get_or_init(|| {
-        let set = std::env::var("VICTORY_LIST_IDLE_MOST")
+const IDLE_MOST: (usize, u64) = (512, 256 << 20);
+
+// Idle-list trim: memory stack by skornuta (skornuta/victory-memory-stack 57fb136, GPL-3.0),
+// patch 13 (and the idle trim of its base).
+
+/// Idle lists destroyed by [`idle_trim`] since the start.
+#[cfg(windows)]
+pub(crate) static TRIMMED_LISTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// After how many seconds an idle list nobody took is destroyed, with its
+/// command allocators: `VICTORY_LIST_POOL_IDLE_S=<seconds>`, or with
+/// `VICTORY_ALLOCATOR_TRIM=1` its time (`crate::host::allocator_trim`);
+/// neither: never, as before. The pool is last in, first out, so the
+/// oldest entries are the surplus of a spike.
+#[cfg(windows)]
+fn idle_trim() -> Option<u64> {
+    static S: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *S.get_or_init(|| {
+        std::env::var("VICTORY_LIST_POOL_IDLE_S")
             .ok()
-            .and_then(|v| v.trim().parse().ok());
-        set.map_or(512, |n: usize| n.clamp(16, 4096))
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|&s| s > 0)
+            .or_else(crate::host::allocator_trim)
     })
 }
 
-/// The most upload memory idle host lists may keep between them (a list
-/// keeps scratch chunks over a reset only while lists do not share them,
-/// `VICTORY_SCRATCH_POOL=0`).
+/// How many of the first of `pushed_at` (oldest first) are older than
+/// `max_age` at `now`.
 #[cfg(windows)]
-const IDLE_BYTES: u64 = 256 << 20;
-
-/// How long idle host lists none took may stay before some are let go, in
-/// milliseconds (0, by default: they stay, as before;
-/// `VICTORY_LIST_IDLE_TRIM_S=N`, N seconds, 10 to try). A D3D12 allocator
-/// keeps its memory over a reset, so an idle list keeps the most its
-/// commands ever took.
-#[cfg(windows)]
-fn trim_ms() -> u64 {
-    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *MS.get_or_init(|| {
-        let set = std::env::var("VICTORY_LIST_IDLE_TRIM_S")
-            .ok()
-            .and_then(|v| v.trim().parse().ok());
-        set.map_or(0, |s: u64| s.saturating_mul(1000))
-    })
-}
-
-/// Idle host lists a trim always leaves.
-#[cfg(any(windows, test))]
-const TRIM_FLOOR: usize = 16;
-/// The most idle host lists one trim lets go.
-#[cfg(any(windows, test))]
-const TRIM_PER_TICK: usize = 32;
-
-/// How many idle host lists a trim lets go when `low` of them were never
-/// taken in its window: those above `floor`, `per_tick` at most.
-#[cfg(any(windows, test))]
-fn trim_count(low: usize, floor: usize, per_tick: usize) -> usize {
-    low.saturating_sub(floor).min(per_tick)
+fn stale(pushed_at: impl Iterator<Item = u64>, now: u64, max_age: u64) -> usize {
+    pushed_at.take_while(|&t| now.saturating_sub(t) > max_age).count()
 }
 
 /// Whether host lists that have run are used again (on by default;
@@ -313,15 +354,14 @@ fn pools() -> bool {
 fn fresh_list() -> Option<crate::host::HostList> {
     let idle = {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        let taken = idle.lists.pop();
-        if let Some(Idle(_, bytes)) = &taken {
-            idle.bytes -= bytes;
+        let taken = idle.0.pop();
+        if let Some(Idle(_, bytes, _)) = &taken {
+            idle.1 -= bytes;
         }
-        idle.low = idle.low.min(idle.lists.len());
         taken
     };
     match idle {
-        Some(Idle(list, _)) => Some(list),
+        Some(Idle(list, _, _)) => Some(list),
         None => crate::host::host().and_then(|h| h.new_list().ok()),
     }
 }
@@ -339,7 +379,12 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).lists.len() >= idle_most() {
+        if !ran.contains(&i) {
+            continue;
+        }
+        if IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+            // Its submission has run: its prelude serves another list.
+            host.give_prelude();
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -347,31 +392,24 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         host.reset();
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.lists.len() < idle_most() && idle.bytes + bytes <= IDLE_BYTES {
-            idle.lists.push(Idle(host, bytes));
-            idle.bytes += bytes;
+        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
+            let now = crate::host::now_ms();
+            idle.0.push(Idle(host, bytes, now));
+            idle.1 += bytes;
+            // With `VICTORY_ALLOCATOR_TRIM=1` (memory stack by skornuta,
+            // skornuta/victory-memory-stack 57fb136, GPL-3.0): lists the
+            // frames did not need for that long are destroyed, with their
+            // allocators. Their submissions have run, as every idle list's.
+            if let Some(secs) = idle_trim() {
+                let n = stale(idle.0.iter().map(|i| i.2), now, secs * 1000);
+                let gone: Vec<Idle> = idle.0.drain(..n).collect();
+                idle.1 -= gone.iter().map(|i| i.1).sum::<u64>();
+                TRIMMED_LISTS.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                drop(idle);
+                drop(gone);
+            }
         }
     }
-    let window = trim_ms();
-    if window == 0 {
-        return;
-    }
-    // What none took in the window goes, the longest idle first (the bottom
-    // of the stack), dropped out of the lock as a full pool drops a list.
-    let gone: Vec<Idle> = {
-        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        let now = crate::host::now_ms();
-        if now.saturating_sub(idle.since_ms) < window {
-            return;
-        }
-        let n = trim_count(idle.low, TRIM_FLOOR, TRIM_PER_TICK);
-        let gone: Vec<Idle> = idle.lists.drain(..n).collect();
-        idle.bytes -= gone.iter().map(|Idle(_, b)| b).sum::<u64>();
-        idle.low = idle.lists.len();
-        idle.since_ms = now;
-        gone
-    };
-    drop(gone);
 }
 
 /// A wait for a memory value recorded into list `this`, with waits cut
@@ -487,14 +525,16 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             continue;
         };
         // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
+        // reset, which finds it so (or wants it closed).
+        fresh.leave_open();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
         let Some(host) = list.host.replace(fresh) else {
             continue;
         };
+        // (Submitted again without a reset: it runs closed, empty.)
+        host.close_if_left_open();
         let earlier = std::mem::take(&mut list.earlier);
         let gate = std::mem::take(&mut list.gate);
         let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
@@ -559,8 +599,8 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             continue;
         };
         // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
+        // reset, which finds it so (or wants it closed).
+        fresh.leave_open();
         let list = this.cast_mut().cast::<List>();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
@@ -568,6 +608,8 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             let Some(host) = (*list).host.replace(fresh) else {
                 continue;
             };
+            // (Submitted again without a reset: it runs closed, empty.)
+            host.close_if_left_open();
             let uploads =
                 std::mem::take(&mut *(*list).uploads.lock().unwrap_or_else(|e| e.into_inner()));
             let state =
@@ -1233,20 +1275,15 @@ extern "system" fn copy_texture_region(
             let text = || {
                 // SAFETY: a live texture; the box is the title's or null.
                 let (d, b) = unsafe { (to.GetDesc(), host_box.map(|b| *b)) };
-                // (A subresource index sits where a footprint's offset does.)
-                let sub = |l: &CopyLocation| if l.kind == FOOTPRINT { "footprint".to_owned() } else { format!("sub {}", l.footprint.offset as u32) };
                 format!(
-                    "copy to {:?} {}x{} f{} levels {} sub/kind {} ({}) at {x},{y},{z} from {:?} kind {} ({}) footprint {:?} box {b:?}",
+                    "copy to {:?} {}x{} f{} sub/kind {} at {x},{y},{z} from {:?} kind {} footprint {:?} box {b:?}",
                     dst.resource,
                     d.Width,
                     d.Height,
                     d.Format.0,
-                    d.MipLevels,
                     dst.kind,
-                    sub(&dst),
                     src.resource,
                     src.kind,
-                    sub(&src),
                     (src.kind == FOOTPRINT).then_some(src.footprint)
                 )
             };
@@ -1629,7 +1666,7 @@ static ALLOCATOR_FUNCTIONS: Table<24> = {
 extern "system" fn set_pipeline(this: This, pipeline: This) {
     crate::pipeline::bound(pipeline);
     #[cfg(windows)]
-    with_state(this, |_, state| state.set_pipeline(pipeline));
+    with_binding(this, |state| state.set_pipeline(pipeline));
     #[cfg(not(windows))]
     let _ = this;
 }
@@ -1731,7 +1768,7 @@ extern "system" fn ignored_state(_: This) {}
 /// set on the host list at once. Without a host GPU these do nothing.
 #[cfg(windows)]
 mod state {
-    use super::{This, with_state};
+    use super::{This, with_binding, with_state};
     use crate::draw::{IndexView, VertexView};
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
@@ -1773,16 +1810,16 @@ mod state {
         with_state(this, |list, s| s.set_depth_bounds(list, min, max));
     }
     pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
-        with_state(this, |_, s| s.set_heaps(items(heaps, count)));
+        with_binding(this, |s| s.set_heaps(items(heaps, count)));
     }
     pub(super) extern "system" fn compute_table(this: This, slot: u32, handle: u64) {
-        with_state(this, |_, s| s.set_table(true, slot, handle));
+        with_binding(this, |s| s.set_table(true, slot, handle));
     }
     pub(super) extern "system" fn graphics_table(this: This, slot: u32, handle: u64) {
-        with_state(this, |_, s| s.set_table(false, slot, handle));
+        with_binding(this, |s| s.set_table(false, slot, handle));
     }
     pub(super) extern "system" fn compute_constant(this: This, slot: u32, value: u32, offset: u32) {
-        with_state(this, |_, s| s.set_constants(true, slot, &[value], offset));
+        with_binding(this, |s| s.set_constants(true, slot, &[value], offset));
     }
     pub(super) extern "system" fn graphics_constant(
         this: This,
@@ -1790,7 +1827,7 @@ mod state {
         value: u32,
         offset: u32,
     ) {
-        with_state(this, |_, s| s.set_constants(false, slot, &[value], offset));
+        with_binding(this, |s| s.set_constants(false, slot, &[value], offset));
     }
     pub(super) extern "system" fn compute_constants(
         this: This,
@@ -1799,9 +1836,7 @@ mod state {
         values: *const u32,
         offset: u32,
     ) {
-        with_state(this, |_, s| {
-            s.set_constants(true, slot, items(values, count), offset)
-        });
+        with_binding(this, |s| s.set_constants(true, slot, items(values, count), offset));
     }
     pub(super) extern "system" fn graphics_constants(
         this: This,
@@ -1810,20 +1845,18 @@ mod state {
         values: *const u32,
         offset: u32,
     ) {
-        with_state(this, |_, s| {
-            s.set_constants(false, slot, items(values, count), offset)
-        });
+        with_binding(this, |s| s.set_constants(false, slot, items(values, count), offset));
     }
     /// Root constant buffer, shader resource and unordered access views.
     pub(super) extern "system" fn compute_view(this: This, slot: u32, address: u64) {
-        with_state(this, |_, s| s.set_view(true, slot, address));
+        with_binding(this, |s| s.set_view(true, slot, address));
     }
     pub(super) extern "system" fn graphics_view(this: This, slot: u32, address: u64) {
-        with_state(this, |_, s| s.set_view(false, slot, address));
+        with_binding(this, |s| s.set_view(false, slot, address));
     }
     pub(super) extern "system" fn index_buffer(this: This, view: *const IndexView) {
         // SAFETY: the title passes a view or null.
-        with_state(this, |_, s| s.set_index_buffer(unsafe { view.as_ref() }));
+        with_binding(this, |s| s.set_index_buffer(unsafe { view.as_ref() }));
     }
     pub(super) extern "system" fn vertex_buffers(
         this: This,
@@ -1831,7 +1864,7 @@ mod state {
         count: u32,
         views: *const VertexView,
     ) {
-        with_state(this, |_, s| {
+        with_binding(this, |s| {
             if views.is_null() {
                 s.clear_vertex_buffers(start, count);
             } else {
@@ -1948,6 +1981,15 @@ mod state {
 
 fn count_draw() {
     DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    DRAWS_EVER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Every draw recorded since the start (the warm-up start watches it).
+static DRAWS_EVER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Draws recorded since the start, any kind ([`take_counts`] empties its own count).
+pub(crate) fn draws_ever() -> u64 {
+    DRAWS_EVER.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Draws of the kinds the host does not run yet (indirect, mesh), and
@@ -1990,7 +2032,7 @@ extern "system" fn execute_indirect(
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
-        with_state(this, |list, s| {
+        with_state_on(host_list_held(this), this, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
     } else {
@@ -2468,39 +2510,16 @@ mod tests {
     use super::*;
     use crate::object::slot;
 
+    /// Only the oldest idle lists, those past the age, are stale (memory
+    /// stack by skornuta, skornuta/victory-memory-stack 57fb136, GPL-3.0).
+    #[cfg(windows)]
     #[test]
-    fn trim_count_keeps_the_floor_and_the_step() {
-        assert_eq!(trim_count(0, TRIM_FLOOR, TRIM_PER_TICK), 0);
-        assert_eq!(trim_count(TRIM_FLOOR, TRIM_FLOOR, TRIM_PER_TICK), 0);
-        assert_eq!(trim_count(TRIM_FLOOR + 5, TRIM_FLOOR, TRIM_PER_TICK), 5);
-        assert_eq!(trim_count(4096, TRIM_FLOOR, TRIM_PER_TICK), TRIM_PER_TICK);
-    }
-
-    /// The low-water mark as `fresh_list` and `recycle` keep it, on plain
-    /// numbers: the bytes of each idle list, their total, and the fewest
-    /// there were since the last trim.
-    #[test]
-    fn a_trim_lets_go_what_none_took() {
-        let mut lists: Vec<u64> = (0..100).collect();
-        let mut bytes: u64 = lists.iter().sum();
-        let mut low = lists.len();
-        // A push never raises it.
-        lists.push(7);
-        bytes += 7;
-        assert_eq!(low, 100);
-        // A window with no pops: all but the floor were idle, a step at most.
-        let n = trim_count(low, TRIM_FLOOR, TRIM_PER_TICK);
-        assert_eq!(n, (100 - TRIM_FLOOR).min(TRIM_PER_TICK));
-        let gone: Vec<u64> = lists.drain(..n).collect();
-        bytes -= gone.iter().sum::<u64>();
-        low = lists.len();
-        // The longest idle went, and the total is what is left.
-        assert_eq!(gone[0], 0);
-        assert_eq!(bytes, lists.iter().sum::<u64>());
-        // A pop lowers it.
-        lists.pop();
-        low = low.min(lists.len());
-        assert_eq!(low, lists.len());
+    fn only_the_oldest_idle_lists_are_stale() {
+        assert_eq!(stale([10, 20, 900, 950].into_iter(), 1000, 100), 2);
+        assert_eq!(stale([950u64].into_iter(), 1000, 100), 0);
+        assert_eq!(stale(std::iter::empty(), 1000, 100), 0);
+        // A clock that reads earlier than a push does not make it stale.
+        assert_eq!(stale([2000u64].into_iter(), 1000, 100), 0);
     }
 
     #[test]
@@ -2567,68 +2586,5 @@ mod tests {
         for object in [buffer, list, allocator] {
             assert_eq!(release(object), 0);
         }
-    }
-
-    /// A back-copied texture written, whose memory the title then reuses
-    /// (its ticket goes stale), and written again in the same list: the
-    /// second write re-registers the read-back. The old dedup stopped at the
-    /// stale entry and dropped it, a missed read-back (the title's ocean
-    /// height map read back nothing).
-    #[cfg(windows)]
-    #[test]
-    fn a_rewritten_back_texture_after_reuse_is_read_back() {
-        use crate::object::guid;
-        use crate::resource::{create_committed, readback_test_descriptions};
-        let Some(_) = crate::host::host() else {
-            return; // no host GPU here
-        };
-        // Make 256x256 R32_FLOAT a back-copied kind, deterministically,
-        // independent of the environment.
-        let _test_kinds = ResetTestKinds(crate::texback::TEST_KINDS.replace(Some(&[(256, 256, 41)])));
-        struct ResetTestKinds(Option<&'static [(u64, u32, u32)]>);
-        impl Drop for ResetTestKinds {
-            fn drop(&mut self) {
-                crate::texback::TEST_KINDS.set(self.0);
-            }
-        }
-        let null = std::ptr::null();
-        let (heap, desc) = readback_test_descriptions();
-        let resource = guid(
-            0x696442be,
-            0xa72e,
-            0x4059,
-            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
-        );
-        let mut tex = null;
-        assert_eq!(
-            create_committed(null, &heap, 0, &desc, 0, null.cast(), &resource, &mut tex),
-            S_OK
-        );
-        let (_, at, _) = crate::resource::title_texture(tex).expect("synthetic title texture");
-        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
-        let new_list = || {
-            let mut allocator = null;
-            assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
-            let mut list = null;
-            assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
-            (list, allocator)
-        };
-        let (list, allocator) = new_list();
-        let host = host_list(list).expect("a host list");
-        host.texture_written(tex);
-        assert!(host.back_wanted_fresh(tex), "the write registered a read-back");
-        // The title reuses the texture's memory: the ticket goes stale.
-        crate::texback::replaced(at);
-        assert!(!host.back_wanted_fresh(tex), "the reuse invalidated the read-back");
-        // Written again in the same list: the read-back is re-registered, not
-        // dropped (the old dedup saw an entry for this texture and stopped).
-        host.texture_written(tex);
-        assert!(host.back_wanted_fresh(tex), "the second write re-registered the read-back");
-        host.close();
-        assert_eq!(host.texture_back_count(), 1, "the rewritten texture was read back");
-        eprintln!("texture ticket regression exercised on host device");
-        assert_eq!(release(list), 0);
-        assert_eq!(release(allocator), 0);
-        assert_eq!(release(tex), 0);
     }
 }

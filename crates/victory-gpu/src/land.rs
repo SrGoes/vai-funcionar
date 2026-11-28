@@ -250,6 +250,8 @@ impl Pool {
     }
 
     fn help(&self) {
+        // (The thread that calls `each` waits for this one's share.)
+        let mut priority = crate::cores::Priority::new();
         let mut state = self.state();
         loop {
             let Some((work, i)) = take(&mut state) else {
@@ -262,6 +264,7 @@ impl Pool {
             // SAFETY: counted in `running`, so `each` has not returned.
             let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { (*work.0)(i) }));
             working.end();
+            priority.keep();
             state = self.state();
             state.running -= 1;
             state.panicked |= ran.is_err();
@@ -562,28 +565,7 @@ pub(crate) unsafe fn piece(
     copy: *const crate::shadow::Shadow,
 ) -> u64 {
     // SAFETY: the caller's.
-    unsafe {
-        piece_at(
-            Landing {
-                title,
-                now,
-                held,
-                parts,
-            },
-            take,
-            notes,
-            beside_on(),
-            copy,
-        )
-    }
-}
-
-/// Where a piece goes and where it comes from, as [`piece`] takes them.
-struct Landing<'a> {
-    title: usize,
-    now: *const u8,
-    held: *mut u8,
-    parts: &'a [(usize, usize)],
+    unsafe { piece_at(title, now, held, parts, take, notes, beside_on(), copy) }
 }
 
 /// [`piece`], and whether a view of ours is looked for.
@@ -591,18 +573,15 @@ struct Landing<'a> {
 /// # Safety
 /// [`piece`]'s.
 unsafe fn piece_at(
-    landing: Landing,
+    title: usize,
+    now: *const u8,
+    held: *mut u8,
+    parts: &[(usize, usize)],
     take: bool,
     notes: &mut Notes,
     beside: bool,
     copy: *const crate::shadow::Shadow,
 ) -> u64 {
-    let Landing {
-        title,
-        now,
-        held,
-        parts,
-    } = landing;
     let Some(end) = parts.last().map(|p| p.1) else {
         return 0;
     };

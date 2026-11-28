@@ -20,12 +20,8 @@
 //! pipelines they were dropped; that run had no lamps and no diffuse light to
 //! its end (run textures-d2, the first after a new translation; Belobug
 //! 18e57db8 found the same).
-//! Persistent initialization producers are started at creation and finished
-//! before their first dispatch, outside that frame budget: a missed head
-//! blendshape mapping leaves subsequent head skinning without its inputs.
 
 use std::collections::VecDeque;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -45,17 +41,11 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
-    /// Report the first request that outlived its frame's compile budget.
-    reported_pending: AtomicBool,
-    /// Distinguishes work created during loading from first-use creation.
-    created_at: Instant,
     /// A pass over the screen ([`GraphicsState::screen_pass`]) or a confirmed
     /// opening-scene / bake producer that must never sit behind cold RT shaders.
     screen: bool,
     /// Confirmed first-scene / bake producer prepared early even on a cold cache.
     scene_input: bool,
-    /// One-time data initialization must finish before its first dispatch.
-    required_initialization: bool,
     /// Why this pipeline is intentionally skipped (e.g. RT resolve without BVH).
     left_out: Option<&'static str>,
 }
@@ -66,14 +56,51 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
         .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
 }
 
-/// This producer writes head mappings retained for the run. Losing its first
-/// dispatch leaves later skinning reading uninitialized data even after the
-/// compiler queue has drained.
-fn required_initialization(shaders: &[Arc<Shader>]) -> bool {
-    named(shaders, b"CS_ComputeBlendshapeMappings")
+/// Shader hashes whose pipelines are left out in every build
+/// (`VICTORY_LEAVE_OUT=<16 hex digits>[,..]`; `VICTORY_SKIP_PIPELINES` does
+/// the same in diagnostics builds only). The decal heap's
+/// `CS_DefragHeap_ComputeRelocations` (02384a60fda6f2d0), translatable for
+/// 32-lane hosts through host waves that meet by spinning, took 11.85 ms of
+/// the card a frame in the first gameplay area (timing run, 2026-11-26).
+fn leave_out() -> &'static [String] {
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    HASHES.get_or_init(|| {
+        std::env::var("VICTORY_LEAVE_OUT")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+            .collect()
+    })
+}
+
+/// The light in the water's volume, in tiles (`water_shading:CS_TransmissionVolumetrics_Tiled`
+/// and `_Tiled_LocalLights`, GTA VI 1.0.2.1): programs of one 64-lane wave a group, which a
+/// host of 32-lane waves gets in the wave-wide form only (`victory_shader::emit`, 4 and 7
+/// branches taken wave-wide). In that form they leave whole tiles of open water dark, around
+/// boats, along shores and under bridges, and take about 15 ms of the card a frame (RTX 5070,
+/// runs r_water1 and r_water3 of 2026-11-26: 25 fps with them, 30 without, the blocks gone;
+/// fxceless/victory-fork's README of 2026-11-27 names the same two programs and form). Left
+/// out there, the water has no light of its own depth (darker, bluer) and no blocks.
+/// foxhound 0.2.0-pre.3 fixed the blocks (64-lane programs on 32-lane waves:
+/// `VICTORY_LOOPS_WAVE`, `VICTORY_LDS_FIRST_INIT`), so they run now unless
+/// `VICTORY_WATER_LIGHT=0` (an empty value, an earlier version's saved OFF, runs them too).
+const WATER_LIGHT: [&str; 2] = ["5dc3b25986622949", "6f225b641c5b0708"];
+
+fn water_light_left_out(shaders: &[Arc<Shader>]) -> bool {
+    static ASKED: OnceLock<bool> = OnceLock::new();
+    *ASKED.get_or_init(|| std::env::var_os("VICTORY_WATER_LIGHT").is_some_and(|v| v == "0"))
+        && victory_shader::emit::host_settings()[0] == 32
+        && shaders.iter().any(|s| WATER_LIGHT.contains(&s.hash.as_str()))
 }
 
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    if !leave_out().is_empty() && shaders.iter().any(|s| leave_out().contains(&s.hash)) {
+        return Some("named in VICTORY_LEAVE_OUT, left out");
+    }
+    if water_light_left_out(shaders) {
+        return Some("the water's tiled light on a host of 32-lane waves, left out (VICTORY_WATER_LIGHT=0)");
+    }
     static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
     let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
         let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
@@ -87,14 +114,15 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     if skip_rt && named(shaders, b"CS_RaytracingResolve") {
         return Some("shades ray-tracing hits without BVH, left out");
     }
+    // The screen probes' ray activation runs without the structure builder
+    // too: left out, the probes kept stale values and surfaces lit mostly by
+    // them took a magenta or violet cast (papers on a wall, irises), at no
+    // frame-rate gain (bisected and measured by a tester, issue #2 of the
+    // public repository, 2026-11-27). `VICTORY_ACTIVATE_RAYS=0`: left out,
+    // as before.
     static SKIP_ACTIVATE_RAYS: OnceLock<bool> = OnceLock::new();
-    let skip_activate = *SKIP_ACTIVATE_RAYS.get_or_init(|| {
-        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
-        if builder {
-            return std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0");
-        }
-        std::env::var_os("VICTORY_ACTIVATE_RAYS").is_none_or(|v| v == "0")
-    });
+    let skip_activate =
+        *SKIP_ACTIVATE_RAYS.get_or_init(|| std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0"));
     if skip_activate && named(shaders, b"CS_ScreenProbes_ActivateRays") {
         return Some("ray activation shader without BVH, left out");
     }
@@ -131,8 +159,7 @@ impl Pending {
             key.update(s.hash.as_bytes());
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
-        let required_initialization = required_initialization(&shaders);
-        let scene_input = required_initialization || scene_input(&shaders);
+        let scene_input = scene_input(&shaders);
         let screen = (graphics.as_ref().is_some_and(|g| g.screen_pass())
             && shaders.iter().all(|s| s.stage != "mesh"))
             || scene_input;
@@ -140,7 +167,6 @@ impl Pending {
         Pending {
             screen,
             scene_input,
-            required_initialization,
             left_out,
             shaders,
             graphics,
@@ -149,8 +175,6 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
-            reported_pending: AtomicBool::new(false),
-            created_at: Instant::now(),
         }
     }
 
@@ -159,24 +183,11 @@ impl Pending {
     }
 
     fn make(&self) {
-        self.make_with(|| {
+        self.made.get_or_init(|| {
             let began = Instant::now();
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
             made
-        });
-    }
-
-    fn make_with(&self, build: impl FnOnce() -> Option<HostPipeline>) {
-        self.made.get_or_init(|| {
-            // A failed translation must complete this queue entry and wake its waiters.
-            match catch_unwind(AssertUnwindSafe(build)) {
-                Ok(pipeline) => pipeline,
-                Err(_) => {
-                    tracing::warn!(shaders = ?self.shaders, "host pipeline build panicked");
-                    None
-                }
-            }
         });
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -184,15 +195,15 @@ impl Pending {
     }
 }
 
-/// Why a pipeline has no host pipeline (diagnostics): its shaders that do
-/// not translate, else "refused" or "being made"; `None` if it has one.
+/// Why a pipeline has no host pipeline (diagnostics): left out on purpose
+/// ([`left_out`]), its shaders that do not translate, else "refused" or
+/// "being made"; `None` if it has one. (A pipeline left out is never made:
+/// it was counted as "being made" in every frame, some 630 indirect
+/// ray-tracing resolves a frame in gameplay, while no pipeline was queued.)
 #[cfg(feature = "diagnostics")]
 pub(crate) fn missing(p: &Pending) -> Option<String> {
-    // Left out on purpose: never queued, so never made. Before this they were
-    // counted as "being made" (about 550 a frame of the world on an RTX 5060,
-    // with nothing queued), which read as a pipeline backlog.
     if let Some(why) = p.left_out {
-        return Some(format!("left out: {why}"));
+        return Some(format!("left out on purpose: {why}"));
     }
     match p.made.get() {
         Some(Some(_)) => None,
@@ -211,38 +222,6 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
             })
         }
     }
-}
-
-/// Diagnostics: says once per set of shaders that a draw or dispatch of
-/// `p` was dropped for want of a host pipeline (`why`, [`missing`]), with
-/// the wave lanes each of its console programs was written for (64 needs a
-/// wave32 lowering on a host of 32-lane waves). Each drop is still counted
-/// by `crate::pipeline::note_why`.
-#[cfg(feature = "diagnostics")]
-pub(crate) fn tell_dropped(p: &Pending, why: &str) {
-    static TOLD: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
-    let key = hashes(p);
-    let new = TOLD.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(key.clone());
-    if !new {
-        return;
-    }
-    let lanes: Vec<String> = p
-        .shaders
-        .iter()
-        .map(|s| {
-            let waves = s.programs().map_or_else(
-                || "unknown".to_owned(),
-                |programs| programs.iter().map(|q| if q.wave64 { "64" } else { "32" }).collect::<Vec<_>>().join("/"),
-            );
-            format!("{} {}: wave {waves}", s.stage, s.hash)
-        })
-        .collect();
-    tracing::warn!(
-        shaders = %key,
-        why,
-        lanes = %lanes.join(", "),
-        "a draw or dispatch dropped without a host pipeline (said once for these shaders)"
-    );
 }
 
 /// The hashes of the shaders `p` is made of.
@@ -285,6 +264,15 @@ fn screens_first() -> bool {
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
 
+/// Draws and dispatches (direct and indirect) asked of a pipeline left out on
+/// purpose ([`left_out`]), since the last [`take_left_out`].
+static LEFT_OUT: AtomicU64 = AtomicU64::new(0);
+
+/// See [`LEFT_OUT`] (for the frame line).
+pub(crate) fn take_left_out() -> u64 {
+    LEFT_OUT.swap(0, Ordering::Relaxed)
+}
+
 /// Pipelines queued and not made yet (for the frame line).
 pub(crate) fn waiting() -> u64 {
     WAITING.load(Ordering::Relaxed)
@@ -294,65 +282,19 @@ pub(crate) fn waiting() -> u64 {
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if p.left_out.is_some() {
+        LEFT_OUT.fetch_add(1, Ordering::Relaxed);
         return None;
     }
     // A still-pending pipeline was requested by the title too. Prewarm it
     // on the next launch, even if this run never got to use it.
-    let first_use = !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed);
-    if first_use {
+    if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
     }
-    let age_at_request = p.made.get().is_none().then(|| p.created_at.elapsed().as_millis() as u64);
-    if age_at_request.is_some() {
+    if p.made.get().is_none() {
         start(p, REQUESTED);
-        if p.required_initialization || (p.graphics.is_none() && compute_waits()) {
-            // OnceLock waits for a worker already compiling this pipeline,
-            // or compiles it here if workers have not taken it yet. The
-            // ordinary shared frame budget cannot discard a one-time write
-            // or a compute dispatch.
-            p.make();
-        } else {
-            wait(p, crate::frame::current());
-        }
-    }
-    if p.made.get().is_none() && !p.reported_pending.swap(true, Ordering::Relaxed) {
-        tracing::info!(
-            frame = crate::frame::current(),
-            pipeline = %p.key,
-            shaders = ?p.shaders,
-            screen = p.screen,
-            scene_input = p.scene_input,
-            age_at_request_ms = age_at_request.unwrap_or(0),
-            queued = WAITING.load(Ordering::Relaxed),
-            "requested pipeline still compiling after its wait budget; its draw or dispatch cannot run"
-        );
-    }
-    if first_use && p.required_initialization {
-        tracing::info!(frame = crate::frame::current(), shaders = ?p.shaders,
-            ready = p.made.get().is_some_and(|made| made.is_some()),
-            "persistent initialization pipeline resolved before its first dispatch");
+        wait(p, crate::frame::current());
     }
     p.made.get()?.as_ref()
-}
-
-/// Whether a dispatch waits for its compute pipeline until it is made,
-/// whatever the frame's budget ([`wait_budget`]); a draw still waits within
-/// the budget and is dropped while its pipeline is not there.
-///
-/// A dropped draw is drawn again in the next frame. A dropped dispatch may
-/// not be: the title runs some compute passes once, when a scene changes
-/// (a buffer reset or cleared), and what they leave is read for as long as
-/// the scene lasts. In the prison corridor a compute program met for the
-/// first time took 4.4 s to make on a 16 GB machine; its one dispatch was
-/// dropped after the half second of budget, and the windows of the room
-/// before stayed blended over the whole picture for minutes (run 195).
-/// A wait of seconds once (the pipeline library has it on the next run)
-/// against a picture wrong until the scene ends.
-/// On by default; `VICTORY_PIPELINE_COMPUTE_WAIT=0`: within the budget, as
-/// before.
-fn compute_waits() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_COMPUTE_WAIT").is_none_or(|v| v != "0"))
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
@@ -620,7 +562,6 @@ fn workers() -> bool {
             let screens_only = i >= workers;
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
-                .stack_size(victory_shader::emit::PIPELINE_STACK)
                 .spawn(move || {
                     // Below the title's own threads (loading, recording),
                     // and the streaming one, which is below normal itself
@@ -680,55 +621,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn initialization_producers_are_started_early_without_classifying_recurring_skinning() {
-        let pending = |stage: &'static str, text: &[u8]| {
-            // Real containers identify their stage. Keep the synthetic
-            // containers distinct too: the shader factory deduplicates bytes.
-            let data = [stage.as_bytes(), b":", text].concat();
-            Pending::new(vec![super::super::shader(stage, &data)], None)
-        };
-        let name = b"CS_ComputeBlendshapeMappings";
-        let p = pending("compute", name);
-        assert!(p.required_initialization && p.scene_input && p.screen);
-        assert!(!pending("pixel", name).required_initialization);
-        assert!(!pending("compute", b"CS_PedStandardSkinning_0").required_initialization);
-    }
-
-    #[test]
-    fn first_initialization_dispatch_waits_for_the_compiler_past_the_frame_budget() {
-        let mut p = Pending::new(Vec::new(), None);
-        p.required_initialization = true;
-        // A worker has already claimed this pipeline, but its driver compile
-        // has not finished. No real GPU or proprietary shader is needed.
-        p.queue_state.store(MAKING, Ordering::Relaxed);
-        let p = Arc::new(p);
-        let entered = std::sync::Barrier::new(2);
-        let (release, gate) = std::sync::mpsc::channel();
-        let (returned, result) = std::sync::mpsc::channel();
-        std::thread::scope(|scope| {
-            let worker = p.clone();
-            let worker_entered = &entered;
-            scope.spawn(move || {
-                worker.made.get_or_init(|| {
-                    worker_entered.wait();
-                    gate.recv().unwrap();
-                    None
-                });
-            });
-            entered.wait();
-            scope.spawn(|| returned.send(ready(&p).is_some()).unwrap());
-            // The default frame budget is 500 ms. The dispatch must still
-            // be waiting after that budget, rather than returning pending.
-            let early = result.recv_timeout(Duration::from_millis(650));
-            release.send(()).unwrap();
-            assert!(matches!(early, Err(std::sync::mpsc::RecvTimeoutError::Timeout)));
-            assert!(!result.recv_timeout(Duration::from_secs(10)).unwrap());
-        });
-        assert!(p.made.get().is_some());
-        assert!(!p.reported_pending.load(Ordering::Relaxed));
-    }
-
-    #[test]
     fn worker_count_follows_the_processors_and_the_switch() {
         assert_eq!(worker_count(None, 1), 2);
         assert_eq!(worker_count(None, 24), 16);
@@ -739,24 +631,6 @@ mod tests {
         assert_eq!(worker_count_for(None, 16, true), 8);
         assert_eq!(worker_count_for(None, 24, true), 8);
         assert_eq!(worker_count_for(Some(12), 8, true), 12);
-    }
-
-    #[test]
-    fn a_panicking_pipeline_is_refused_and_the_worker_continues() {
-        let bad = Arc::new(Pending::new(Vec::new(), None));
-        let good = Arc::new(Pending::new(Vec::new(), None));
-        let failed = bad.clone();
-        let next = good.clone();
-        let worker = std::thread::spawn(move || {
-            failed.make_with(|| panic!("synthetic pipeline build panic"));
-            next.make_with(|| None);
-        });
-
-        worker.join().expect("the pipeline worker should survive");
-        assert!(matches!(bad.made.get(), Some(None)));
-        assert!(matches!(good.made.get(), Some(None)));
-
-        bad.make_with(|| panic!("the refused pipeline should stay complete"));
     }
 
     /// A first use queues the pipeline and, within the budget, gets the
@@ -773,20 +647,26 @@ mod tests {
         assert!(matches!(p.made.get(), Some(None)));
     }
 
-    /// A pipeline left out on purpose is reported as such, not as one still
-    /// being made: it is never queued.
-    #[cfg(feature = "diagnostics")]
+    /// A pipeline left out on purpose (a ray-tracing resolve without the structure builder)
+    /// is never queued, so never made: it is counted as left out, and named so, not as
+    /// "being made" (some 630 indirect dispatches a frame were, in every gameplay frame).
     #[test]
-    fn a_left_out_pipeline_is_not_reported_as_being_made() {
+    fn pipelines_left_out_are_counted_and_never_queued() {
         let mut p = Pending::new(Vec::new(), None);
         p.left_out = Some("shades ray-tracing hits without BVH, left out");
         let p = Arc::new(p);
+        let before = LEFT_OUT.load(Ordering::Relaxed);
         assert!(ready(&p).is_none());
+        assert!(ready(&p).is_none());
+        assert!(!now(&p));
         assert_eq!(p.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
-        assert_eq!(missing(&p).as_deref(), Some("left out: shades ray-tracing hits without BVH, left out"));
-        let queued = Arc::new(Pending::new(Vec::new(), None));
-        queued.queue_state.store(MAKING, Ordering::Relaxed);
-        assert_eq!(missing(&queued).as_deref(), Some("being made"));
+        assert!(p.made.get().is_none());
+        assert!(LEFT_OUT.load(Ordering::Relaxed) >= before + 2);
+        #[cfg(feature = "diagnostics")]
+        assert_eq!(
+            missing(&p).as_deref(),
+            Some("left out on purpose: shades ray-tracing hits without BVH, left out")
+        );
     }
 
     #[test]
@@ -798,10 +678,8 @@ mod tests {
         let p = Arc::new(p);
 
         assert!(!super::super::library::wanted_early(&p.key));
-        // A compute pipeline is made at once when dispatches wait for theirs
-        // (#1312, the default; it has no shaders here, so nothing comes of
-        // it); either way it is noted for the next launch.
         assert!(ready(&p).is_none());
+        assert!(p.made.get().is_none());
         assert!(super::super::library::wanted_early(&p.key));
     }
 

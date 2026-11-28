@@ -10,8 +10,16 @@
 
 use std::mem::ManuallyDrop;
 
+/// The Agility SDK runtime `victory.exe` runs on, as for the unit tests: the
+/// in-box D3D12 of Windows 10 refuses the mesh pipeline, and the recorder must
+/// be tried against the runtime the title meets.
+#[cfg(agility_runtime)]
+#[path = "../src/agility.rs"]
+mod agility;
+
 use victory_gpu::replay::play::{self, Buffers, Options, Player};
 use victory_gpu::replay::record::{self, At, Settings};
+use victory_gpu::replay::still;
 use windows::Win32::Foundation::{HANDLE, HWND, RECT};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::{
@@ -1643,6 +1651,11 @@ fn a_frame_is_recorded_and_replayed() {
         .map(|c| [c[0], c[1], c[2], c[3]])
         .collect();
     assert!(colors.len() > 30, "{}", colors.len());
+    assert_eq!(
+        still::stood(),
+        std::time::Duration::ZERO,
+        "nothing stood still yet"
+    );
 
     // With it: armed at the first present, the fourth frame is captured (a
     // frame whose lists are all recorded comes first).
@@ -1680,6 +1693,8 @@ fn a_frame_is_recorded_and_replayed() {
         "see {}",
         folder.display()
     );
+    // The captured frame's submissions and present held the title still.
+    assert!(still::stood() > std::time::Duration::ZERO);
     let expected = scene.outcome();
     // It goes on as it did without the recorder.
     scene.frame(4);

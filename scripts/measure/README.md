@@ -3,7 +3,7 @@
 Ferramentas para medir FPS e comparar imagem sempre do mesmo jeito: abrem o jogo sozinhas pelo `scripts\play.ps1`, esperam o mundo, medem e fecham. Os resultados e as capturas ficam fora do repositório (por padrão em `%TEMP%`) e nunca vão para o GitHub.
 
 ## Antes de medir
-- Windows, Python 3.9 ou mais novo, `pip install pillow numpy` (só para `ab.py` e `vis360.py`).
+- Windows, Python 3.9 ou mais novo, `pip install pillow numpy` (só para `ab.py`, `vis360.py` e `burst.py`).
 - `VICTORY_GAME_DIR` com a pasta da sua cópia do jogo (o executável é `game_scarlett_master.exe`, como no `Play-VIctory.cmd`).
 - O build de diagnóstico (`cargo build --locked --profile diag -p victory --features diagnostics`); no Windows 10, `cargo xtask agility` antes. O build de release só dá o FPS do título da janela.
 - Cache aquecido, o MESMO que a rodada vai usar. A rota nvidia usa `%LOCALAPPDATA%\VIctory\cache-pareto` quando `VICTORY_CACHE_DIR` não está definida; a rota amd usa o cache normal. Defina `VICTORY_CACHE_DIR` na janela (o `play.ps1` a mantém) e aqueça com ela: `target\diag\victory.exe shaders <arquivos .rpf>` e `target\diag\victory.exe warm --used`.
@@ -41,6 +41,16 @@ python scripts\measure\vis360.py run cand nvidia diag $giro 45        # com VIS_
 python scripts\measure\vis360.py compare <rodada base> <rodada cand> <saída> --giro 21-35 --mask 460,130,760,440
 ```
 O roteiro: mundo, 20 s parado, rajada de 10 quadros seguidos, giro de 360 graus em 12 s com um print a cada 0,5 s, outra rajada aos 40 s, e fecha aos 45 s. O `compare` casa as capturas pelo tempo desde o primeiro quadro do mundo, então o mesmo ângulo cai no mesmo par mesmo com FPS diferente. Saída: uma folha de contato por ângulo (base, candidato, diferença), o pisca de cada rajada (um bloco que muda num quadro e volta no seguinte) e os draws descartados por motivo.
+
+## Rajadas e fervura numa gravação: `burst.py`
+Grave com `VICTORY_CAPTURE_EVERY_MS` (um print a cada N ms) e `VICTORY_CAPTURE_BURST_MS` (`início_ms:quadros`, vários separados por vírgula; a rajada pega quadros seguidos), como no `vis360.py`. Depois, um comando só sobre a pasta da rodada:
+```powershell
+python -I scripts\measure\burst.py run <pasta da rodada> <prefixo de saída> [--skip 2] [--window 40]
+python -I scripts\measure\burst.py sheet <saída.png> <N> <rodada> [<rodada>...]   # folha de contato, uma linha por rodada
+```
+Rajada = 8 ou mais quadros seguidos em `cap`. O JSON traz, por rajada: `pct_blocks_flick_any` / `_often` (% de blocos de 16 px que mudam num quadro e voltam no seguinte, em qualquer quadro / em 25% ou mais deles), `pct_blocks_changing_often` (blocos que mudam em metade dos quadros: movimento, não pisca) e `pct_px_boil_gt3` (% de pixels com fervura acima de 3). Fervura por pixel = desvio padrão no tempo × parcela de trocas de sinal da variação entre quadros: alta só onde o pixel sobe e desce sem parar; movimento de câmera dá desvio alto e quase nenhuma troca. A fervura usa `--window` quadros (40) depois de pular `--skip` (2) do começo da rajada, que ainda assentam; câmera parada. Imagens (só em `<prefixo>`, fora do repositório): `-mundo.png`, `-pisca<i>.png` (mapa de calor do pisca), `-ferve<i>.png` (média | mapa da fervura), `-seq<i>.png`, `-rajada<i>.gif`.
+
+Referência de 27/11 (`D:\victory-night\victory-run-20261127-141002-grava-1`): rajada 1498..1543 → 5,18% de pixels com fervura > 3; rajada 1718..1762 → 1,02%. Uma rajada curta (a de 9 quadros em 1318, com a câmera ainda se mexendo) dá número alto e não vale como fervura.
 
 ## Tempo de cada quadro com o PresentMon: `presentmon.ps1`
 O título da janela dá o FPS médio; o PresentMon dá o tempo de cada quadro, de onde saem a mediana, o p95, o p99 e as travadas. Ele mede o jogo que **já está aberto**: abra pelo `Play-VIctory.cmd` ou pelo `scripts\play.ps1`, chegue ao mundo e rode em outra janela.

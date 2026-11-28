@@ -24,6 +24,8 @@ static MISSES: AtomicU64 = AtomicU64::new(0);
 
 /// Keeps translated shaders in `dir` from now on.
 pub fn use_shader_cache(dir: PathBuf) {
+    #[cfg(windows)]
+    crate::pipeline::samplers::use_folder(dir.with_file_name("pipelines"));
     match Cache::open(dir) {
         Ok(cache) => {
             let _ = CACHE.set(cache);
@@ -64,11 +66,11 @@ fn build() -> [u8; 32] {
         // executable had cached with the switch unset.
         for name in [
             "VICTORY_WAVE_WIDE",
-            "VICTORY_WAVE_WIDE_ONLY",
             "VICTORY_WAVE_DEEP_SKIPS",
             "VICTORY_WAVE_OWN_BITS",
             "VICTORY_WAVE_LOCAL",
             "VICTORY_F16_NEAREST",
+            "VICTORY_FILTER_3D",
             "VICTORY_HELPER_OWN",
             "VICTORY_FIRSTLANE_OWN",
             "VICTORY_FIRST_HALF",
@@ -76,6 +78,9 @@ fn build() -> [u8; 32] {
             "VICTORY_MESH_OUTPUT_STRICT",
             "VICTORY_BVH_FENCES",
             "VICTORY_BVH_BOUNDS",
+            "VICTORY_THREAD_TICKET",
+            "VICTORY_LDS_LOOP_ATOMICS",
+            "VICTORY_LDS_BOUNDS",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
@@ -84,14 +89,18 @@ fn build() -> [u8; 32] {
             }
             bytes.push(0);
         }
+        // So is whether pixel programs keep the console's early depth test
+        // (`VICTORY_EARLY_DEPTH=1`): only while it is on, so that the
+        // translations cached without it are still served without it.
+        if victory_shader::emit::early_depth() {
+            tracing::info!(
+                "VICTORY_EARLY_DEPTH=1: pixel programs whose console code tests depth before them get the host's early depth-stencil test"
+            );
+            bytes.extend_from_slice(b"VICTORY_EARLY_DEPTH=1");
+            bytes.push(0);
+        }
         // And which clean-up passes ran over the translated code.
         bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
-        // Renderer port 5 (`VICTORY_PORT_CBV=1`): constant buffers read as raw
-        // bytes. Only when on, so the translations cached without it keep
-        // their key.
-        if victory_shader::emit::constants_raw() {
-            bytes.extend_from_slice(b"VICTORY_PORT_CBV=1");
-        }
         bytes
     });
     let mut hash = blake3::Hasher::new();
@@ -122,16 +131,15 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| {
-        let hash = blake3::hash(c).to_hex();
-        let wide = victory_shader::emit::wave_wide_only(&hash[..16]);
-        victory_shader::emit::with_wave_wide(wide, || victory_shader::emit::translate(c))
-            .map_err(|e| e.to_string())
-    };
-    match CACHE.get() {
+    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let shader = match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
         None => translate(container),
-    }
+    }?;
+    // Its static samplers into the list every process makes them from.
+    #[cfg(windows)]
+    crate::pipeline::samplers::know(&shader.static_samplers);
+    Ok(shader)
 }
 
 /// The cache entry's converter: the build and the container in, the
